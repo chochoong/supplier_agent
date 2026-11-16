@@ -1,1 +1,2 @@
-anthropic>=0.70.0
+anthropic>=2.8,<3
+-e ../trade-hub
