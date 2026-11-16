@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-1번 에이전트(시장조사·아이템 발굴) 결과를 공용 DB(trade-hub)에 저장한다.
+1번 에이전트(시장조사·아이템 발굴) 결과를 공용 DB(trade_hub)에 저장한다.
 
   python discover_store.py import-reports [reports]   # 예전 reports/*_discover/raw.json을 DB로 가져오기
 """

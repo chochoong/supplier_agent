@@ -4,7 +4,7 @@
 **1번 시장조사·아이템 발굴**만 맡습니다. 국내외 트렌드·검색량·경쟁 가격·리뷰를 조사해
 "수요는 있는데 공급(경쟁)이 적은" 수입 후보 품목을 찾아 점수표로 만듭니다.
 
-결과는 공용 DB(**[trade-hub](../trade-hub)**)에 후보 품목으로 기록되고, 다음 단계 에이전트와 슈퍼바이저가 읽습니다.
+결과는 공용 DB(**[trade_hub](../trade_hub)**)에 후보 품목으로 기록되고, 다음 단계 에이전트와 슈퍼바이저가 읽습니다.
 공급처 섭외·견적·통관·원가 계산은 다른 에이전트의 일이라 하지 않습니다.
 
 | 파일 | 역할 |
@@ -15,10 +15,10 @@
 ## 1. 설치
 
 ```bash
-pip install -r requirements.txt     # anthropic + ../trade-hub (공용 DB 패키지)
+pip install -r requirements.txt     # anthropic + ../trade_hub (공용 DB 패키지)
 ```
 
-`../trade-hub` 폴더가 있어야 합니다. 프로젝트 폴더의 `.env`에 키를 넣습니다 (git에 올라가지 않음).
+`../trade_hub` 폴더가 있어야 합니다. 프로젝트 폴더의 `.env`에 키를 넣습니다 (git에 올라가지 않음).
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...              # Claude
@@ -57,24 +57,24 @@ python supplier_agent.py --count 5 --provider openrouter
 2. 네이버 키가 있으면 후보별 검색량지수('텀블러'=100)·직전 3개월/전년 대비 성장률을 조회해 모델이 점수를 재검토
    (검색량이 거의 없는 후보는 교체)
 3. 총점(100점 만점) 순으로 정렬해 `reports/날짜_시간_discover/`에 `candidates.html`·`candidates.csv`·`raw.json` 저장
-4. 공용 DB(trade-hub)에 후보 품목(`stage=candidate`)과 점수를 기록 (점수표의 **번호** = DB 품목 번호)
+4. 공용 DB(trade_hub)에 후보 품목(`stage=candidate`)과 점수를 기록 (점수표의 **번호** = DB 품목 번호)
 
 점수는 모델의 판단이고 판매가·FOB 시세는 웹 검색 기준 참고값입니다. 검색량은 판매량이 아닙니다.
 
 ### 다음 단계로 넘기기
 
-진행할 품목은 사람이 골라 공급처 발굴 단계로 넘깁니다 (trade-hub 명령). 2번 에이전트는 `stage=sourcing`인 품목을 처리합니다.
+진행할 품목은 사람이 골라 공급처 발굴 단계로 넘깁니다 (trade_hub 명령). 2번 에이전트는 `stage=sourcing`인 품목을 처리합니다.
 
 ```bash
-trade-hub candidates          # 후보 목록 (번호·최신 점수)
-trade-hub select 3 7 12       # 3·7·12번을 sourcing 단계로
-trade-hub drop 5 "검색량 부족" # 중단 (사유 기록)
+trade_hub candidates          # 후보 목록 (번호·최신 점수)
+trade_hub select 3 7 12       # 3·7·12번을 sourcing 단계로
+trade_hub drop 5 "검색량 부족" # 중단 (사유 기록)
 python discover_store.py import-reports   # 예전 reports/*_discover 결과를 DB로 (이미 있는 건 건너뜀)
 ```
 
 ## 3. 정기 실행
 
-슈퍼바이저(trade-hub)가 `supervisor.json` 설정에 따라 주 1회 실행합니다. 직접 등록할 필요는 없습니다.
+슈퍼바이저(trade_hub)가 `supervisor.json` 설정에 따라 주 1회 실행합니다. 직접 등록할 필요는 없습니다.
 
 ## 4. 주의
 

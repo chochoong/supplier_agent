@@ -12,7 +12,7 @@
 
 결과물:
   - reports/YYYY-MM-DD_HHMM_discover/ : candidates.html(점수표) · candidates.csv · raw.json
-  - 공용 DB(trade-hub): 후보 품목(stage=candidate)과 점수 → 다음 단계 에이전트·슈퍼바이저가 읽음
+  - 공용 DB(trade_hub): 후보 품목(stage=candidate)과 점수 → 다음 단계 에이전트·슈퍼바이저가 읽음
 """
 
 import argparse
@@ -27,9 +27,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 try:
-    from trade_hub import db as trade_db      # 공용 DB (C:/workspace/trade-hub)
+    from trade_hub import db as trade_db      # 공용 DB (C:/workspace/trade_hub)
 except ImportError:
-    sys.exit("trade-hub 패키지가 필요합니다:  pip install -r requirements.txt  (../trade-hub를 설치합니다)")
+    sys.exit("trade_hub 패키지가 필요합니다:  pip install -r requirements.txt  (../trade_hub를 설치합니다)")
 import discover_store
 
 try:
@@ -479,7 +479,7 @@ def score_candidates(candidates):
 def handoff_command(candidates, n=3):
     """상위 후보를 다음 단계(공급처 발굴 에이전트)로 넘기는 명령어. DB 단계를 sourcing으로 바꾼다."""
     ids = " ".join(str(c["_id"]) for c in candidates[:n] if c.get("_id"))
-    return f"trade-hub select {ids}"
+    return f"trade_hub select {ids}"
 
 
 def write_candidates(outdir, candidates, args):
