@@ -7,6 +7,7 @@
   python supplier_agent.py "LED 무드등" "요가매트"       # 여러 품목
   python supplier_agent.py --auto                       # 유망 품목을 에이전트가 직접 선정
   python supplier_agent.py --auto --count 2 --suppliers 4 --usd-krw 1390
+  python supplier_agent.py --discover --hint "주방·수납, 1만~3만원대"   # 후보 점수표만 (저렴)
 
 결과물: reports/YYYY-MM-DD_HHMM/ 폴더에
   - report.md      : 품목별 공급처 비교, 원가·마진, RFQ 이메일 초안
@@ -18,8 +19,11 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
-from datetime import datetime
+import urllib.error
+import urllib.request
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 try:
@@ -128,6 +132,54 @@ SUBMIT_PRODUCTS_TOOL = {
     },
 }
 
+# --discover: 후보 품목 평가 항목 (키, 표시 이름, 총점 가중치, 평가 기준)
+SCORE_ITEMS = [
+    ("demand", "수요", 0.30, "검색량·판매량·리뷰 수·시즌 수요 근거가 강할수록 높게"),
+    ("margin", "마진 여지", 0.25, "국내 판매가 대비 해외 FOB 단가가 낮을수록 높게"),
+    ("competition", "경쟁 여유", 0.20, "쿠팡·네이버에 같은 상품 판매자가 적을수록 높게 (레드오션 = 1)"),
+    ("regulation", "규제 용이", 0.15, "KC·전파·식약처 등 인증 부담이 낮을수록 높게"),
+    ("logistics", "물류 용이", 0.10, "작고 가볍고 파손 위험이 낮을수록 높게"),
+]
+
+SUBMIT_CANDIDATES_TOOL = {
+    "name": "submit_candidates",
+    "description": "조사한 수입 후보 품목들을 항목별 평가 점수와 함께 제출합니다. 확인 못한 값은 null로 둡니다.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "품목명 (한국어, 구체적으로)"},
+                        "search_keyword_en": {"type": "string", "description": "공급처 검색용 영어 키워드"},
+                        "category": {"type": "string", "description": "카테고리 (예: 주방, 캠핑, 반려동물)"},
+                        "keywords_ko": {"type": "array", "items": {"type": "string"},
+                                        "description": "네이버 검색량 조회용 짧은 한국어 키워드 1~3개. 소비자가 실제로 "
+                                                       "검색할 말로 (예: '주방 벽선반', '무타공 선반'). 첫 번째가 대표 키워드"},
+                        "reason": {"type": "string", "description": "수요·트렌드 근거 (확인한 수치·출처 포함)"},
+                        "est_retail_krw": {"type": ["number", "null"], "description": "국내 판매가 시세 (원, 중간값)"},
+                        "est_fob_usd": {"type": ["number", "null"], "description": "해외 FOB 단가 시세 (USD, 중간값)"},
+                        "regulations": {"type": ["string", "null"], "description": "필요한 인증·규제"},
+                        "risk": {"type": ["string", "null"], "description": "주의할 위험 요소"},
+                        "scores": {
+                            "type": "object",
+                            "description": "각 항목 1~5점 (5가 가장 유리)",
+                            "properties": {k: {"type": "number", "minimum": 1, "maximum": 5, "description": f"{label}: {rule}"}
+                                           for k, label, _, rule in SCORE_ITEMS},
+                            "required": [k for k, *_ in SCORE_ITEMS],
+                        },
+                        "score_notes": {"type": "string", "description": "점수 근거 요약 (항목별 한 줄)"},
+                    },
+                    "required": ["name", "search_keyword_en", "category", "keywords_ko", "reason", "scores", "score_notes"],
+                },
+            }
+        },
+        "required": ["candidates"],
+    },
+}
+
 SUBMIT_SUPPLIERS_TOOL = {
     "name": "submit_suppliers",
     "description": "한 품목에 대해 조사한 공급처 후보와 비용 추정치를 제출합니다. 확인 못한 값은 null로 둡니다.",
@@ -207,6 +259,11 @@ def validate(value, schema, path="입력"):
             return [f"{path}: {'/'.join(types)} 타입이어야 합니다 (받은 값: {value!r:.60})"]
     if "enum" in schema and value not in schema["enum"]:
         errors.append(f"{path}: {schema['enum']} 중 하나여야 합니다 (받은 값: {value!r})")
+    if _TYPE_CHECKS["number"](value):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append(f"{path}: {schema['minimum']} 이상이어야 합니다 (받은 값: {value!r})")
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append(f"{path}: {schema['maximum']} 이하여야 합니다 (받은 값: {value!r})")
     if isinstance(value, dict):
         for key in schema.get("required", []):
             if key not in value:
@@ -223,12 +280,14 @@ def validate(value, schema, path="입력"):
 # ---------------------------------------------------------------------------
 # 에이전트 실행 루프
 # ---------------------------------------------------------------------------
-def run_agent(backend, prompt, submit_tool, log=print):
-    """web_search로 조사하게 한 뒤, submit_tool 호출 내용을 받아 반환한다."""
+def run_agent(backend, prompt, submit_tool, log=print, review=None):
+    """web_search로 조사하게 한 뒤, submit_tool 호출 내용을 받아 반환한다.
+    review(제출값)가 문자열을 돌려주면 그 내용(예: 실측 데이터)을 모델에게 보여주고 한 번 다시 제출받는다."""
     client, model, search_tool, extra, _ = backend
     tools = [search_tool, submit_tool]
     messages = [{"role": "user", "content": prompt}]
     nudged = False
+    reviewed = False
     retries = 0
 
     for _ in range(12):  # 안전장치
@@ -261,7 +320,17 @@ def run_agent(backend, prompt, submit_tool, log=print):
             else:
                 errors = validate(submit.input, submit_tool["input_schema"])
             if not errors:
-                return submit.input
+                feedback = None
+                if review and not reviewed:
+                    reviewed = True
+                    feedback = review(submit.input)
+                if not feedback:
+                    return submit.input
+                log("    ↺ 실측 데이터 전달 → 점수 재검토 요청")
+                messages.append({"role": "assistant", "content": resp.content})
+                messages.append({"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": submit.id, "content": feedback}]})
+                continue
             if retries >= 2:
                 raise RuntimeError("제출 형식 오류가 반복됩니다: " + "; ".join(errors[:5]))
             retries += 1
@@ -292,6 +361,128 @@ def run_agent(backend, prompt, submit_tool, log=print):
         break
 
     raise RuntimeError("에이전트가 결과를 제출하지 않았습니다.")
+
+
+# ---------------------------------------------------------------------------
+# 네이버 실측 데이터 (네이버 클라우드 NAVER API HUB: 검색어 트렌드)
+# 문서: https://api.ncloud-docs.com/docs/naver-api-hub-search-trend
+# HUB에는 쇼핑 '상품 검색'(상품 수·최저가) API가 없으므로 검색량 추이만 사용한다.
+# ---------------------------------------------------------------------------
+NAVER_API_HOST = "https://naverapihub.apigw.ntruss.com"
+NAVER_TREND_PATH = "/search-trend/v1/search"
+NAVER_TREND_ANCHOR = "텀블러"   # 검색량 지수의 기준 키워드 (=100). 배치가 달라도 비교할 수 있게 매 요청에 함께 넣음
+
+
+class NaverError(Exception):
+    pass
+
+
+def naver_keys():
+    cid, secret = os.environ.get("NAVER_CLIENT_ID"), os.environ.get("NAVER_CLIENT_SECRET")
+    return (cid, secret) if cid and secret else None
+
+
+def _naver_call(path, keys, body):
+    headers = {"X-NCP-APIGW-API-KEY-ID": keys[0], "X-NCP-APIGW-API-KEY": keys[1],
+               "Content-Type": "application/json"}
+    req = urllib.request.Request(NAVER_API_HOST + path, data=json.dumps(body).encode("utf-8"),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read()).get("error", {})
+            msg = f"{err.get('message', '')} {err.get('details', '')}".strip()
+        except Exception:
+            msg = ""
+        raise NaverError(f"HTTP {e.code} {msg}".strip()) from None
+    except urllib.error.URLError as e:
+        raise NaverError(f"연결 실패: {e.reason}") from None
+
+
+def _month_window(today=None):
+    """지난 15개월(이번 달 제외)의 첫날 목록과 조회 시작·끝 날짜."""
+    today = today or date.today()
+    y, m = today.year, today.month
+    months = []
+    for back in range(15, 0, -1):
+        yy, mm = divmod((y * 12 + m - 1) - back, 12)
+        months.append(date(yy, mm + 1, 1))
+    end = date(y, m, 1) - timedelta(days=1)
+    return months, months[0].isoformat(), end.isoformat()
+
+
+def naver_trends(groups, keys, today=None):
+    """groups: {이름: [키워드...]} → {이름: {volume_idx, growth_3m, yoy}}.
+    volume_idx: 최근 3개월 검색량을 기준 키워드(NAVER_TREND_ANCHOR)=100으로 환산
+    growth_3m: 최근 3개월 / 직전 3개월 - 1,  yoy: 최근 3개월 / 1년 전 같은 3개월 - 1"""
+    months, start, end = _month_window(today)
+    names = list(groups)
+    out = {}
+    for i in range(0, len(names), 4):            # 요청당 최대 5그룹 = 후보 4 + 기준 1
+        batch = names[i:i + 4]
+        body = {"startDate": start, "endDate": end, "timeUnit": "month",
+                "keywordGroups": [{"groupName": f"g{j}", "keywords": groups[n][:20]} for j, n in enumerate(batch)]
+                + [{"groupName": "anchor", "keywords": [NAVER_TREND_ANCHOR]}]}
+        res = _naver_call(NAVER_TREND_PATH, keys, body)
+        series = {}
+        for r in res.get("results", []):
+            by_period = {d["period"][:7]: d["ratio"] for d in r.get("data", [])}
+            series[r["title"]] = [by_period.get(mo.isoformat()[:7], 0.0) for mo in months]
+        anchor = sum(series.get("anchor", [0] * 15)[-3:])
+        for j, n in enumerate(batch):
+            s = series.get(f"g{j}", [0.0] * 15)
+            recent, prev, year_ago = sum(s[-3:]), sum(s[-6:-3]), sum(s[:3])
+            out[n] = {
+                "volume_idx": round(recent / anchor * 100, 2) if anchor else None,
+                "growth_3m": round((recent / prev - 1) * 100) if prev else None,
+                "yoy": round((recent / year_ago - 1) * 100) if year_ago else None,
+            }
+    return out
+
+
+def naver_lookup(candidates, keys, cache, log=print):
+    """후보별 네이버 검색어 트렌드를 조회해 cache[품목명]에 넣는다. 실패하면 None."""
+    todo = {c["name"]: [k for k in c.get("keywords_ko", []) if k.strip()][:3] or [c["name"]]
+            for c in candidates if c["name"] not in cache}
+    if not todo:
+        return
+    try:
+        trends = naver_trends(todo, keys)
+    except NaverError as e:
+        if str(e).startswith(("HTTP 401", "HTTP 403")):
+            log(f"    ⚠️ 네이버 API HUB 인증/권한 오류({e}) → 네이버 데이터 없이 진행합니다. "
+                "콘솔의 NAVER API HUB 애플리케이션에 '검색어 트렌드' 구독이 있는지, 키가 그 애플리케이션 것인지 확인하세요.")
+        else:
+            log(f"    ⚠️ 네이버 검색어 트렌드 조회 실패: {e}")
+        trends = {}
+    for name, kws in todo.items():
+        cache[name] = {"keyword": kws[0], "keywords": kws, **trends[name]} if trends.get(name) else None
+
+
+def naver_summary(name, d):
+    if not d:
+        return f"- {name}: 네이버 데이터 조회 실패"
+    pct = lambda v: "미확인" if v is None else f"{v:+d}%"
+    vol = "미확인" if d.get("volume_idx") is None else f"{d['volume_idx']}"
+    return (f"- {name} [검색어 {', '.join(d['keywords'])}]: 검색량지수 {vol} · "
+            f"최근3개월 성장 {pct(d.get('growth_3m'))} · 전년동기 대비 {pct(d.get('yoy'))}")
+
+
+def naver_review(keys, cache, log=print):
+    """--discover 제출 후 네이버 검색어 트렌드를 모델에게 보여주고 점수를 다시 매기게 하는 review 함수."""
+    def review(submitted):
+        log("    📊 네이버 검색어 트렌드 조회 중...")
+        naver_lookup(submitted["candidates"], keys, cache, log)
+        lines = [naver_summary(c["name"], cache.get(c["name"])) for c in submitted["candidates"]]
+        if not any(cache.get(c["name"]) for c in submitted["candidates"]):
+            return None   # 전부 실패 → 재검토 없이 그대로 사용
+        return (f"네이버 검색어 트렌드 실측 데이터입니다 (검색량지수는 '{NAVER_TREND_ANCHOR}'의 최근 3개월 "
+                "네이버 검색량 = 100 기준, 성장률은 직전 3개월·전년 같은 3개월 대비):\n" + "\n".join(lines) +
+                "\n\n이 수치를 반영해 demand 점수를 다시 검토하고(필요하면 다른 점수도), score_notes에 근거 수치를 "
+                "인용해 submit_candidates로 다시 제출하세요. 검색량이 거의 없는 후보는 다른 품목으로 교체해도 됩니다.")
+    return review
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +719,96 @@ def write_html(outdir, products_meta, results, args):
 
 
 # ---------------------------------------------------------------------------
+# --discover: 후보 품목 점수표 (공급처 조사 없이 저렴하게 후보만 비교)
+# ---------------------------------------------------------------------------
+def score_candidates(candidates, args):
+    """항목 점수로 총점(100점 만점)과 대략적 마진을 계산하고 총점 내림차순으로 정렬한다."""
+    for c in candidates:
+        weighted = sum(w * c["scores"][k] for k, _, w, _ in SCORE_ITEMS)
+        c["_total"] = round(weighted / 5 * 100)
+        # 운임 0·관세 8% 가정의 거친 추정 → 표에서 '참고용'으로 표시
+        c["_landed_krw"] = landed_cost(c.get("est_fob_usd"), None, None, args.usd_krw)
+        c["_profit_krw"], c["_margin_pct"] = margin(c.get("est_retail_krw"), c["_landed_krw"], args.fee)
+    return sorted(candidates, key=lambda c: c["_total"], reverse=True)
+
+
+def next_command(candidates, n=3):
+    """상위 후보로 공급처 조사를 이어서 실행할 명령어."""
+    names = " ".join(f'"{c["name"]}"' for c in candidates[:n])
+    return f"python supplier_agent.py {names}"
+
+
+def write_candidates(outdir, candidates, args):
+    from html import escape
+    outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "raw.json").write_text(
+        json.dumps({"hint": args.hint, "candidates": candidates}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    labels = [label for _, label, _, _ in SCORE_ITEMS]
+    with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["순위", "품목", "카테고리", "총점"] + labels +
+                   ["예상판매가(원)", "FOB시세(USD)", "추정마진(%)",
+                    "네이버검색어", f"검색량지수({NAVER_TREND_ANCHOR}=100)", "3개월성장(%)", "전년대비(%)",
+                    "규제", "위험", "선정근거", "점수근거", "영어키워드"])
+        for i, c in enumerate(candidates, 1):
+            n = c.get("_naver") or {}
+            w.writerow([i, c["name"], c["category"], c["_total"]] + [c["scores"][k] for k, *_ in SCORE_ITEMS] +
+                       [c.get("est_retail_krw"), c.get("est_fob_usd"), c.get("_margin_pct"),
+                        ", ".join(n.get("keywords", [])), n.get("volume_idx"), n.get("growth_3m"), n.get("yoy"),
+                        c.get("regulations"), c.get("risk"), c["reason"], c["score_notes"], c["search_keyword_en"]])
+
+    def e(v, suffix=""):
+        return escape(fmt(v, suffix))
+
+    weights = " · ".join(f"{label} {wt*100:.0f}%" for _, label, wt, _ in SCORE_ITEMS)
+    has_naver = any(c.get("_naver") for c in candidates)
+    naver_note = (f"<br>네이버 데이터: 검색량지수는 최근 3개월 네이버 검색량('{escape(NAVER_TREND_ANCHOR)}'=100), "
+                  "성장률은 직전 3개월·전년 같은 기간 대비 (NAVER API HUB 검색어 트렌드)."
+                  if has_naver else "")
+    hint = f" · 방향: {escape(args.hint)}" if args.hint else ""
+    cmd = next_command(candidates)
+    H = [f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>후보 품목 {datetime.now():%Y-%m-%d}</title><style>{HTML_STYLE}
+.score{{font-weight:700}}.s5,.s4{{color:var(--good)}}.s3{{color:var(--mid)}}.s2,.s1{{color:var(--bad)}}</style></head><body><main>
+<h1>후보 품목 점수표</h1>
+<p class="sub">{datetime.now():%Y-%m-%d %H:%M}{hint} · 총점 가중치: {weights}<br>
+각 항목 1~5점(5가 유리). 추정마진은 운임 0원·관세 8% 가정의 참고값이며 실제보다 높게 나옵니다.{naver_note}</p>
+<section class="card"><h2>다음 단계</h2><p>마음에 드는 품목만 골라 공급처를 조사하세요. 상위 3개 예:</p>
+<pre id="cmd">{escape(cmd)}</pre>
+<button onclick="navigator.clipboard.writeText(document.getElementById('cmd').innerText).then(()=>{{this.textContent='복사됨 ✓'}})">명령어 복사</button></section>
+<section class="card"><div class="scroll"><table><tr><th>#</th><th>품목</th><th>카테고리</th><th>총점</th>"""
+         + "".join(f"<th>{escape(l)}</th>" for l in labels)
+         + "<th>예상판매가</th><th>FOB시세</th><th>추정마진</th>"
+         + (f"<th title='최근 3개월 네이버 검색량, {escape(NAVER_TREND_ANCHOR)}=100'>검색량지수</th>"
+            "<th>3개월 성장</th><th>전년 대비</th>" if has_naver else "")
+         + "</tr>"]
+    for i, c in enumerate(candidates, 1):
+        cells = "".join(f"<td class='num score s{round(c['scores'][k])}'>{e(c['scores'][k])}</td>" for k, *_ in SCORE_ITEMS)
+        if has_naver:
+            n = c.get("_naver") or {}
+            g = lambda v: "미확인" if v is None else f"{v:+d}%"
+            cells_n = (f"<td class='num'>{e(n.get('volume_idx'))}</td><td class='num'>{g(n.get('growth_3m'))}</td>"
+                       f"<td class='num'>{g(n.get('yoy'))}</td>")
+        else:
+            cells_n = ""
+        H.append(f"<tr><td>{i}</td><td><b>{escape(c['name'])}</b></td><td>{escape(c['category'])}</td>"
+                 f"<td class='num'><b>{c['_total']}</b></td>{cells}"
+                 f"<td class='num'>{e(c.get('est_retail_krw'), '원')}</td>"
+                 f"<td class='num'>{e(c.get('est_fob_usd'), ' USD')}</td>"
+                 f"<td class='num'>{e(c.get('_margin_pct'), '%')}</td>{cells_n}</tr>")
+    H.append("</table></div></section><section class='card'><h2>후보별 근거</h2><ul class='notes'>")
+    for i, c in enumerate(candidates, 1):
+        risk = f"<br><span class='flag'>⚠️ {escape(c['risk'])}</span>" if c.get("risk") else ""
+        H.append(f"<li><b>{i}. {escape(c['name'])}</b> ({escape(c['search_keyword_en'])})<br>{escape(c['reason'])}"
+                 f"<br><small>점수 근거: {escape(c['score_notes'])}</small>"
+                 f"<br><small>규제: {e(c.get('regulations'))}</small>{risk}</li>")
+    H.append("</ul></section></main></body></html>")
+    (outdir / "candidates.html").write_text("\n".join(H), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
 def load_dotenv(path):
@@ -541,7 +822,11 @@ def load_dotenv(path):
             continue
         key, value = line.split("=", 1)
         key = key.strip().removeprefix("export ").strip()
-        value = value.strip().strip('"').strip("'")
+        value = value.strip()
+        if value[:1] in ('"', "'") and value[0] in value[1:]:
+            value = value[1:value.index(value[0], 1)]       # 따옴표 안의 값만 (뒤 주석 무시)
+        else:
+            value = re.split(r"(?:^|\s+)#", value, maxsplit=1)[0].strip()   # 'KEY=값  # 설명' 형태의 주석 제거
         if key and value:
             os.environ.setdefault(key, value)
 
@@ -555,7 +840,11 @@ def main():
     ap = argparse.ArgumentParser(description="해외 공급처 발굴 에이전트")
     ap.add_argument("products", nargs="*", help="조사할 품목 (한국어 OK)")
     ap.add_argument("--auto", action="store_true", help="유망 수입 품목을 에이전트가 직접 선정")
-    ap.add_argument("--count", type=int, default=3, help="--auto 시 선정할 품목 수 (기본 3)")
+    ap.add_argument("--discover", action="store_true",
+                    help="공급처 조사 없이 후보 품목 점수표만 만듦 (저렴). 마음에 드는 품목만 골라 이어서 조사")
+    ap.add_argument("--hint", default=None,
+                    help='--auto/--discover 시 품목 방향. 예: --hint "주방·수납, 1만~3만원대, 겨울 시즌"')
+    ap.add_argument("--count", type=int, default=None, help="선정할 품목 수 (기본: --auto 3, --discover 10)")
     ap.add_argument("--suppliers", type=int, default=5, help="품목당 공급처 후보 수 (기본 5)")
     ap.add_argument("--usd-krw", type=float, default=1400.0, help="원/달러 환율 (기본 1400, 최신값 넣기 권장)")
     ap.add_argument("--fee", type=float, default=0.11, help="판매 플랫폼 수수료율 (기본 0.11 = 11%)")
@@ -569,8 +858,16 @@ def main():
     ap.add_argument("--no-open", action="store_true", help="끝난 뒤 브라우저로 리포트를 열지 않음 (정기 실행용)")
     args = ap.parse_args()
 
-    if not args.products and not args.auto:
-        ap.error("품목을 입력하거나 --auto를 사용하세요. 예: python supplier_agent.py \"요가매트\"")
+    if args.discover and (args.auto or args.products):
+        ap.error("--discover는 품목 입력이나 --auto와 함께 쓸 수 없습니다")
+    if not args.products and not args.auto and not args.discover:
+        ap.error("품목을 입력하거나 --auto / --discover를 사용하세요. 예: python supplier_agent.py \"요가매트\"")
+    if args.hint and not (args.auto or args.discover):
+        ap.error("--hint는 --auto 또는 --discover와 함께 씁니다")
+    if args.count is None:
+        args.count = 10 if args.discover else 3
+    if args.count < 1:
+        ap.error("--count는 1 이상이어야 합니다")
     # 스크립트 폴더의 .env를 읽음 (작업 스케줄러처럼 다른 폴더에서 실행돼도 찾도록)
     load_dotenv(Path(__file__).resolve().parent / ".env")
     if args.provider is None:
@@ -581,14 +878,56 @@ def main():
     _, model, _, extra, label = backend
     effort = f" · effort: {extra['output_config']['effort']}" if extra.get("output_config") else ""
     print(f"▶ 접속: {label} · 모델: {model}{effort}")
+    today = datetime.now().strftime("%Y년 %m월 %d일")
+    hint = (f"\n사용자가 원하는 방향: {args.hint}\n이 방향(카테고리·가격대·시즌 등)에 맞는 품목만 고르세요.\n"
+            if args.hint else "")
+
+    # 후보 점수표만 만들고 끝 (공급처 조사 없음)
+    if args.discover:
+        print(f"▶ 후보 품목 {args.count}개 조사·평가 중..." + (f" (방향: {args.hint})" if args.hint else ""))
+        criteria = "\n".join(f"  · {k} ({label}): {rule}" for k, label, _, rule in SCORE_ITEMS)
+        keys, naver_cache = naver_keys(), {}
+        print("  · 네이버 실측 데이터: " + ("사용 (제출 후 네이버 검색어 트렌드로 점수 재검토)" if keys
+                                       else "사용 안 함 (.env에 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET 없음)"))
+        data = run_agent(backend, f"""오늘은 {today}입니다.
+{hint}
+한국 시장의 최근 소비 트렌드, 네이버·쿠팡 인기 카테고리와 리뷰 수, 해외직구 인기 품목, 다가오는 시즌 수요를 조사해서
+1인 수입 무역 후보 품목 {args.count}개를 골라 submit_candidates로 제출하세요.
+- 서로 겹치지 않는 품목으로 고릅니다 (같은 품목의 색상·사이즈 변형은 하나로 봅니다).
+- 각 후보를 아래 5개 항목에 대해 1~5점(5가 가장 유리)으로 평가하고 score_notes에 항목별 근거를 한 줄씩 적습니다.
+{criteria}
+- 국내 판매가(est_retail_krw)와 해외 FOB 단가(est_fob_usd)는 검색으로 확인한 시세로 적고, 못 찾으면 null로 둡니다.
+- 점수를 후하게 주지 마세요. 근거가 약하면 3점 이하로 줍니다.""", SUBMIT_CANDIDATES_TOOL,
+                         review=naver_review(keys, naver_cache) if keys else None)
+        if keys:   # 재제출 때 교체된 후보도 조회
+            naver_lookup(data["candidates"], keys, naver_cache)
+        for c in data["candidates"]:
+            c["_naver"] = naver_cache.get(c["name"])
+        candidates = score_candidates(data["candidates"], args)
+        outdir = Path(args.out) / datetime.now().strftime("%Y-%m-%d_%H%M_discover")
+        write_candidates(outdir, candidates, args)
+        print()
+        for i, c in enumerate(candidates, 1):
+            n = c.get("_naver") or {}
+            extra = (f" · 검색량지수 {fmt(n.get('volume_idx'))} · 전년 대비 "
+                     f"{'미확인' if n.get('yoy') is None else format(n['yoy'], '+d') + '%'}" if n else "")
+            print(f"  {i:>2}. [{c['_total']:>3}점] {c['name']} ({c['category']}){extra}")
+        html_path = (outdir / "candidates.html").resolve()
+        print(f"\n✅ 완료: {html_path}")
+        print(f"   다음 단계 (상위 3개 공급처 조사): {next_command(candidates)}")
+        if not args.no_open:
+            import webbrowser
+            webbrowser.open(html_path.as_uri())
+        return
+
     products_meta = []
     targets = [{"name": p, "search_keyword_en": None, "est_retail_krw": None} for p in args.products]
 
     # 1단계: 품목 자동 선정
     if args.auto:
-        print(f"▶ 유망 수입 품목 {args.count}개 선정 중...")
-        today = datetime.now().strftime("%Y년 %m월 %d일")
+        print(f"▶ 유망 수입 품목 {args.count}개 선정 중..." + (f" (방향: {args.hint})" if args.hint else ""))
         data = run_agent(backend, f"""오늘은 {today}입니다.
+{hint}
 한국 시장의 최근 소비 트렌드, 네이버·쿠팡 인기 카테고리, 해외직구 인기 품목, 다가오는 시즌 수요를 조사해서
 1인 수입 무역에 적합한 유망 품목 {args.count}개를 골라 submit_products로 제출하세요.
 조건: 소량 발주 가능, 부피·무게가 작음, 인증·규제가 명확하거나 부담이 낮음, 마진 여지 있음.
