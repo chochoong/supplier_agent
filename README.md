@@ -47,6 +47,7 @@ python supplier_agent.py --count 5 --provider openrouter
 | 옵션 | 설명 | 기본값 |
 |---|---|---|
 | `--hint` | 방향 (카테고리·가격대·시즌 등) | 없음 |
+| `--product` | 발굴 대신 **이 품목 하나만** 조사·평가 (예: `--product "무선 기계식 키보드 75%"`). DB에 `origin=manual` 후보로 저장. 대시보드 서버(`trade_hub serve`)의 검색창 [새로 조사]가 이 모드를 실행 | 없음 |
 | `--count` | 후보 품목 수 | 10 |
 | `--provider` | `anthropic`(Claude) 또는 `openrouter`(DeepSeek 등) | `.env`의 PROVIDER, 없으면 anthropic |
 | `--model` | 모델 | anthropic: claude-sonnet-5-5 / openrouter: `.env`의 OPENROUTER_MODEL |

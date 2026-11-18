@@ -118,6 +118,9 @@ SCORE_ITEMS = [
     ("logistics", "물류 용이", 0.10, "작고 가볍고 파손 위험이 낮을수록 높게"),
 ]
 
+REF_URL_DESC = ("이 품목이 어떤 물건인지 보여 주는 대표 상품 페이지 URL 1~3개 (좋은 순서). "
+                "검색 결과에서 실제로 본 URL만 (지어내지 말 것). 없으면 빈 배열")
+
 SUBMIT_CANDIDATES_TOOL = {
     "name": "submit_candidates",
     "description": "조사한 수입 후보 품목들을 항목별 평가 점수와 함께 제출합니다. 확인 못한 값은 null로 둡니다.",
@@ -140,6 +143,7 @@ SUBMIT_CANDIDATES_TOOL = {
                         "est_fob_usd": {"type": ["number", "null"], "description": "해외 FOB 단가 시세 (USD, 중간값)"},
                         "regulations": {"type": ["string", "null"], "description": "필요한 인증·규제"},
                         "risk": {"type": ["string", "null"], "description": "주의할 위험 요소"},
+                        "ref_urls": {"type": "array", "items": {"type": "string"}, "description": REF_URL_DESC},
                         "scores": {
                             "type": "object",
                             "description": "각 항목 1~5점 (5가 가장 유리)",
@@ -176,6 +180,7 @@ _TYPE_CHECKS = {
     "array": lambda v: isinstance(v, list),
     "string": lambda v: isinstance(v, str),
     "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
     "null": lambda v: v is None,
 }
 
@@ -402,8 +407,9 @@ def naver_summary(name, d):
             f"최근3개월 성장 {pct(d.get('growth_3m'))} · 전년동기 대비 {pct(d.get('yoy'))}")
 
 
-def naver_review(keys, cache, log=print):
-    """--discover 제출 후 네이버 검색어 트렌드를 모델에게 보여주고 점수를 다시 매기게 하는 review 함수."""
+def naver_review(keys, cache, log=print, allow_replace=True):
+    """제출 후 네이버 검색어 트렌드를 모델에게 보여주고 점수를 다시 매기게 하는 review 함수.
+    allow_replace=False(지정 품목 조사)면 품목을 바꾸지 말고 점수만 다시 매기게 한다."""
     def review(submitted):
         log("    📊 네이버 검색어 트렌드 조회 중...")
         naver_lookup(submitted["candidates"], keys, cache, log)
@@ -413,7 +419,9 @@ def naver_review(keys, cache, log=print):
         return (f"네이버 검색어 트렌드 실측 데이터입니다 (검색량지수는 '{NAVER_TREND_ANCHOR}'의 최근 3개월 "
                 "네이버 검색량 = 100 기준, 성장률은 직전 3개월·전년 같은 3개월 대비):\n" + "\n".join(lines) +
                 "\n\n이 수치를 반영해 demand 점수를 다시 검토하고(필요하면 다른 점수도), score_notes에 근거 수치를 "
-                "인용해 submit_candidates로 다시 제출하세요. 검색량이 거의 없는 후보는 다른 품목으로 교체해도 됩니다.")
+                "인용해 submit_candidates로 다시 제출하세요. " +
+                ("검색량이 거의 없는 후보는 다른 품목으로 교체해도 됩니다." if allow_replace
+                 else "사용자가 지정한 품목이므로 품목은 바꾸지 말고 점수와 근거만 고치세요."))
     return review
 
 
@@ -468,6 +476,14 @@ button{border:1px solid var(--line);background:var(--card);color:var(--text);bor
 # ---------------------------------------------------------------------------
 # 후보 품목 점수표
 # ---------------------------------------------------------------------------
+def set_ref_url(candidates):
+    """ref_urls 중 첫 번째를 참고 페이지(ref_url)로. 사진은 수집하지 않는다
+    (확정 사진은 사람이 올리거나 공급사 사진에서 고르고, 참고 이미지는 대시보드가 화면에만 표시)."""
+    for c in candidates:
+        urls = [u for u in (c.get("ref_urls") or []) if isinstance(u, str) and re.match(r"https?://", u)]
+        c["ref_url"] = urls[0] if urls else None
+
+
 def score_candidates(candidates):
     """항목 점수로 총점(100점 만점)을 계산하고 총점 내림차순으로 정렬한다."""
     for c in candidates:
@@ -515,7 +531,7 @@ def write_candidates(outdir, candidates, args):
     H = [f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>후보 품목 {datetime.now():%Y-%m-%d}</title><style>{HTML_STYLE}
-.score{{font-weight:700}}.s5,.s4{{color:var(--good)}}.s3{{color:var(--mid)}}.s2,.s1{{color:var(--bad)}}</style></head><body><main>
+.ref{{font-size:12px}}.pname{{min-width:220px}}.score{{font-weight:700}}.s5,.s4{{color:var(--good)}}.s3{{color:var(--mid)}}.s2,.s1{{color:var(--bad)}}</style></head><body><main>
 <h1>후보 품목 점수표</h1>
 <p class="sub">{datetime.now():%Y-%m-%d %H:%M}{hint} · 총점 가중치: {weights}<br>
 각 항목 1~5점(5가 유리). 판매가·FOB 시세는 웹 검색 기준 참고값입니다.{naver_note}</p>
@@ -537,7 +553,9 @@ def write_candidates(outdir, candidates, args):
                        f"<td class='num'>{g(n.get('yoy'))}</td>")
         else:
             cells_n = ""
-        H.append(f"<tr><td>{e(c.get('_id'))}</td><td><b>{escape(c['name'])}</b></td><td>{escape(c['category'])}</td>"
+        ref = (f"<br><a class='ref' href='{escape(c['ref_url'], quote=True)}' target='_blank' rel='noopener'>참고 페이지 ↗</a>"
+               if c.get("ref_url") else "")
+        H.append(f"<tr><td>{e(c.get('_id'))}</td><td class='pname'><b>{escape(c['name'])}</b>{ref}</td><td>{escape(c['category'])}</td>"
                  f"<td class='num'><b>{c['_total']}</b></td>{cells}"
                  f"<td class='num'>{e(c.get('est_retail_krw'), '원')}</td>"
                  f"<td class='num'>{e(c.get('est_fob_usd'), ' USD')}</td>{cells_n}</tr>")
@@ -585,6 +603,8 @@ def main():
     ap.add_argument("--hint", default=None,
                     help='품목 방향. 예: --hint "주방·수납, 1만~3만원대, 겨울 시즌"')
     ap.add_argument("--count", type=int, default=10, help="후보 품목 수 (기본 10)")
+    ap.add_argument("--product", default=None,
+                    help='발굴 대신 이 품목 하나만 조사·평가 (예: --product "무선 기계식 키보드 75%%"). DB에는 origin=manual')
     ap.add_argument("--provider", choices=["anthropic", "openrouter"],
                     default=None,
                     help="anthropic = Claude(ANTHROPIC_API_KEY), openrouter = DeepSeek 등(OPENROUTER_API_KEY). "
@@ -596,6 +616,10 @@ def main():
     args = ap.parse_args()
     if args.count < 1:
         ap.error("--count는 1 이상이어야 합니다")
+    if args.product is not None:
+        args.product = " ".join(args.product.split())[:100]
+        if not args.product:
+            ap.error("--product에 품목명을 적어 주세요")
     # 스크립트 폴더의 .env를 읽음 (작업 스케줄러처럼 다른 폴더에서 실행돼도 찾도록)
     load_dotenv(Path(__file__).resolve().parent / ".env")
     if args.provider is None:
@@ -612,7 +636,7 @@ def main():
 
     conn = trade_db.connect()
     with trade_db.agent_run(conn, "discover", provider=args.provider, model=model,
-                            args={"hint": args.hint, "count": args.count}) as run:
+                            args={"product": args.product} if args.product else {"hint": args.hint, "count": args.count}) as run:
         html_path = run_discover(backend, args, today, hint, conn, run)
     if not args.no_open:
         import webbrowser
@@ -628,32 +652,53 @@ def new_outdir(base, suffix=""):
     return outdir
 
 
+def product_task(product):
+    """지정 품목 조사 프롬프트 앞부분 (발굴 대신 사용자가 정한 품목 하나를 평가)."""
+    return f"""사용자가 수입을 검토하는 품목: "{product}"
+이 품목 하나만 조사·평가해서 submit_candidates로 제출하세요 (candidates 배열에 1개).
+- 다른 품목으로 바꾸지 마세요. name은 이 품목을 가리키는 구체적인 한국어 품목명으로 적습니다
+  (사용자가 쓴 표현을 살리고, 필요하면 규격·형태만 덧붙입니다).
+- 국내 판매 현황(네이버·쿠팡 가격대, 주요 경쟁 상품과 리뷰 수), 해외 트렌드, 해외 FOB 시세, 시즌성을 조사합니다.
+- 수입에 불리한 점(인증 부담, 경쟁 포화, 마진 부족 등)도 숨기지 말고 점수와 risk에 반영합니다."""
+
+
 def run_discover(backend, args, today, hint, conn, run):
-    """후보 품목을 조사·평가해 점수표를 만들고 공용 DB에 candidate로 등록한다."""
-    print(f"▶ 후보 품목 {args.count}개 조사·평가 중..." + (f" (방향: {args.hint})" if args.hint else ""))
+    """후보 품목을 조사·평가해 점수표를 만들고 공용 DB에 candidate로 등록한다.
+    args.product가 있으면 발굴 대신 그 품목 하나만 조사한다 (DB origin=manual)."""
+    product = getattr(args, "product", None)
+    if product:
+        print(f"▶ 지정 품목 조사·평가 중: {product}")
+    else:
+        print(f"▶ 후보 품목 {args.count}개 조사·평가 중..." + (f" (방향: {args.hint})" if args.hint else ""))
     criteria = "\n".join(f"  · {k} ({label}): {rule}" for k, label, _, rule in SCORE_ITEMS)
     keys, naver_cache = naver_keys(), {}
     print("  · 네이버 실측 데이터: " + ("사용 (제출 후 네이버 검색어 트렌드로 점수 재검토)" if keys
                                    else "사용 안 함 (.env에 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET 없음)"))
-    data = run_agent(backend, f"""오늘은 {today}입니다.
-{hint}
+    task = product_task(product) if product else f"""{hint}
 한국 시장의 최근 소비 트렌드, 네이버·쿠팡 인기 카테고리와 리뷰 수, 해외(아마존·틱톡 등) 트렌드, 해외직구 인기 품목,
 다가오는 시즌 수요를 조사해서 "수요는 있는데 공급(경쟁)이 적은"
 1인 수입 무역 후보 품목 {args.count}개를 골라 submit_candidates로 제출하세요.
-- 서로 겹치지 않는 품목으로 고릅니다 (같은 품목의 색상·사이즈 변형은 하나로 봅니다).
+- 서로 겹치지 않는 품목으로 고릅니다 (같은 품목의 색상·사이즈 변형은 하나로 봅니다)."""
+    data = run_agent(backend, f"""오늘은 {today}입니다.
+{task}
 - 각 후보를 아래 5개 항목에 대해 1~5점(5가 가장 유리)으로 평가하고 score_notes에 항목별 근거를 한 줄씩 적습니다.
 {criteria}
 - 국내 판매가(est_retail_krw)와 해외 FOB 단가(est_fob_usd)는 검색으로 확인한 시세로 적고, 못 찾으면 null로 둡니다.
+- ref_urls에는 사람이 어떤 물건인지 확인할 수 있는 대표 상품 페이지 주소 1~3개를 검색 결과에서 골라 적습니다.
 - 점수를 후하게 주지 마세요. 근거가 약하면 3점 이하로 줍니다.""", SUBMIT_CANDIDATES_TOOL,
-                     review=naver_review(keys, naver_cache) if keys else None)
+                     review=naver_review(keys, naver_cache, allow_replace=not product) if keys else None)
+    if product:
+        data["candidates"] = data["candidates"][:1]
     if keys:   # 재제출 때 교체된 후보도 조회
         naver_lookup(data["candidates"], keys, naver_cache)
     for c in data["candidates"]:
         c["_naver"] = naver_cache.get(c["name"])
+    set_ref_url(data["candidates"])
     candidates = score_candidates(data["candidates"])
-    outdir = new_outdir(args.out, "_discover")
+    outdir = new_outdir(args.out, "_product" if product else "_discover")
     run.report_dir = str(outdir.resolve())
-    ids = discover_store.save_discover(conn, run.id, candidates)    # {품목명: DB 번호}
+    ids = discover_store.save_discover(conn, run.id, candidates,    # {품목명: DB 번호}
+                                       origin="manual" if product else "discover")
     for c in candidates:
         c["_id"] = ids.get(c["name"])
     write_candidates(outdir, candidates, args)
@@ -664,6 +709,8 @@ def run_discover(backend, args, today, hint, conn, run):
                  f"{'미확인' if nv.get('yoy') is None else format(nv['yoy'], '+d') + '%'}" if nv else "")
         print(f"  [{c['_id']:>3}] {c['_total']:>3}점  {c['name']} ({c['category']}){extra}")
     html_path = (outdir / "candidates.html").resolve()
+    if product and candidates:
+        print(f"RESULT_PRODUCT_ID={candidates[0]['_id']}")    # trade_hub serve가 결과 화면으로 이동할 때 사용
     print(f"\n✅ 완료: {html_path}")
     print(f"   💾 DB 저장: 후보 {len(ids)}개 (실행 #{run.id}) · 대괄호 안 숫자가 DB 번호")
     print(f"   다음 단계 — 진행할 품목을 공급처 발굴 단계로 넘기기 (예: 상위 3개): {handoff_command(candidates)}")

@@ -15,16 +15,16 @@ from trade_hub import db
 ROOT = Path(__file__).resolve().parent
 
 
-def save_discover(conn, run_id, candidates):
+def save_discover(conn, run_id, candidates, origin="discover"):
     """후보 점수표 → products(candidate) + product_scores. {품목명: 품목 번호}를 돌려준다."""
     ids = {}
     with conn:
         for c in candidates:
             pid = db.upsert_product(
-                conn, c["name"], run_id, origin="discover", category=c.get("category"),
+                conn, c["name"], run_id, origin=origin, category=c.get("category"),
                 search_keyword_en=c.get("search_keyword_en"), keywords_ko_json=db.dumps(c.get("keywords_ko")),
                 reason=c.get("reason"), regulations=c.get("regulations"), risk=c.get("risk"),
-                est_retail_krw=c.get("est_retail_krw"))
+                est_retail_krw=c.get("est_retail_krw"), ref_url=c.get("ref_url"))   # 사진은 저장 안 함 (확정 사진은 사람·공급사 몫)
             s = c.get("scores", {})
             conn.execute(
                 "INSERT INTO product_scores (product_id, run_id, demand, margin, competition, regulation, logistics,"
