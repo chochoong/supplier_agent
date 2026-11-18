@@ -3,3 +3,14 @@ reports/
 __pycache__/
 *.log
 data/
+
+# 비밀값 — 어느 폴더에 두든 커밋 금지 (API 키·OAuth 클라이언트·로그인 토큰)
+.env
+.env.*
+!.env.example
+secrets/
+*credentials*.json
+client_secret*.json
+*token*.json
+*.pem
+*.key
