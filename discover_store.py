@@ -24,7 +24,10 @@ def save_discover(conn, run_id, candidates, origin="discover"):
                 conn, c["name"], run_id, origin=origin, category=c.get("category"),
                 search_keyword_en=c.get("search_keyword_en"), keywords_ko_json=db.dumps(c.get("keywords_ko")),
                 reason=c.get("reason"), regulations=c.get("regulations"), risk=c.get("risk"),
-                est_retail_krw=c.get("est_retail_krw"), ref_url=c.get("ref_url"))   # 사진은 저장 안 함 (확정 사진은 사람·공급사 몫)
+                est_retail_krw=c.get("est_retail_krw"), ref_url=c.get("ref_url"),   # 사진은 저장 안 함 (확정 사진은 사람·공급사 몫)
+                source_country=c.get("source_country"),                            # 2번이 이 나라로 공급처 조사
+                source_country_reason=c.get("source_country_reason"),
+                source_page_url=c.get("source_page_url"))                       # 해외 구매처 상품 상세 → 2번 첫 후보
             s = c.get("scores", {})
             conn.execute(
                 "INSERT INTO product_scores (product_id, run_id, demand, margin, competition, regulation, logistics,"

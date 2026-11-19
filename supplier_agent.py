@@ -121,6 +121,31 @@ SCORE_ITEMS = [
 REF_URL_DESC = ("이 품목이 어떤 물건인지 보여 주는 대표 상품 페이지 URL 1~3개 (좋은 순서). "
                 "검색 결과에서 실제로 본 URL만 (지어내지 말 것). 없으면 빈 배열")
 
+# 추천 공급 국가 = 2번(공급처 발굴)이 조사할 수 있는 나라 (trade_hub db.SOURCE_COUNTRIES 와 같게)
+SOURCE_COUNTRIES = {"China": "중국", "Japan": "일본", "USA": "미국"}
+SOURCE_COUNTRY_DESC = ("이 품목을 들여올 가장 알맞은 공급 국가. China=중국(공산품·저단가·OEM), Japan=일본(일본 브랜드·문구·화장품·"
+                       "캐릭터·품질 중시 생활용품), USA=미국(미국 브랜드·eBay 중고·희소품·빈티지·미국 전용 상품). "
+                       "조사에서 확인한 주 생산지·판매처를 근거로 고르고, 애매하면 단가가 유리한 쪽")
+
+SOURCE_PAGE_DESC = ("조사 중 실제로 열어 본 해외 구매처의 '상품 상세' 페이지 URL 1개 (추천 공급 국가의 판매자 우선). "
+                    "예: alibaba.com/product-detail/..., detail.1688.com/offer/..., aliexpress.com/item/..., "
+                    "item.rakuten.co.jp/..., ebay.com/itm/..., amazon.com/.../dp/.... 다음 단계가 이 판매자를 첫 후보로 검증합니다. "
+                    "검색 결과·카테고리·쇼룸 페이지는 안 됨. 국내 쇼핑몰도 안 됨. 없으면 null (지어내지 말 것)")
+# 해외 구매처 상품 상세 페이지로 인정하는 주소 (검색·카테고리·쇼룸 페이지는 제외)
+SOURCE_PAGE_PATTERNS = [
+    r"alibaba\.com/product-detail/", r"detail\.1688\.com/offer/", r"aliexpress\.(com|us)/item/",
+    r"made-in-china\.com/.*product", r"(item\.taobao|detail\.tmall)\.com/item\.htm", r"dhgate\.com/product/",
+    r"globalsources\.com/.*product", r"item\.rakuten\.co\.jp/", r"amazon\.(com|co\.jp)/(.*/)?(dp|gp/product)/",
+    r"store\.shopping\.yahoo\.co\.jp/[^/]+/[^/]+\.html", r"netsea\.jp/.*(goods|item)", r"superdelivery\.com/(en/)?p/",
+    r"ebay\.com/itm/", r"walmart\.com/ip/", r"thomasnet\.com/.*(product|profile)",
+]
+
+
+def is_source_page(url):
+    return (isinstance(url, str) and re.match(r"https?://", url) is not None
+            and any(re.search(pat, url, re.I) for pat in SOURCE_PAGE_PATTERNS))
+
+
 SUBMIT_CANDIDATES_TOOL = {
     "name": "submit_candidates",
     "description": "조사한 수입 후보 품목들을 항목별 평가 점수와 함께 제출합니다. 확인 못한 값은 null로 둡니다.",
@@ -144,6 +169,10 @@ SUBMIT_CANDIDATES_TOOL = {
                         "regulations": {"type": ["string", "null"], "description": "필요한 인증·규제"},
                         "risk": {"type": ["string", "null"], "description": "주의할 위험 요소"},
                         "ref_urls": {"type": "array", "items": {"type": "string"}, "description": REF_URL_DESC},
+                        "source_page_url": {"type": ["string", "null"], "description": SOURCE_PAGE_DESC},
+                        "source_country": {"type": "string", "enum": list(SOURCE_COUNTRIES), "description": SOURCE_COUNTRY_DESC},
+                        "source_country_reason": {"type": "string",
+                                                  "description": "그 나라를 고른 이유 한 줄 (예: '주 생산지가 중국 선전, 알리바바 FOB 확인')"},
                         "scores": {
                             "type": "object",
                             "description": "각 항목 1~5점 (5가 가장 유리)",
@@ -153,7 +182,8 @@ SUBMIT_CANDIDATES_TOOL = {
                         },
                         "score_notes": {"type": "string", "description": "점수 근거 요약 (항목별 한 줄)"},
                     },
-                    "required": ["name", "search_keyword_en", "category", "keywords_ko", "reason", "scores", "score_notes"],
+                    "required": ["name", "search_keyword_en", "category", "keywords_ko", "reason", "source_country",
+                                 "scores", "score_notes"],
                 },
             }
         },
@@ -482,6 +512,11 @@ def set_ref_url(candidates):
     for c in candidates:
         urls = [u for u in (c.get("ref_urls") or []) if isinstance(u, str) and re.match(r"https?://", u)]
         c["ref_url"] = urls[0] if urls else None
+        src = c.get("source_page_url")
+        if src and not is_source_page(src):          # 상품 상세 페이지가 아니면 버림 (2번이 엉뚱한 페이지를 검증하지 않게)
+            print(f"  · 해외 판매 페이지 제외 (상품 상세 주소 아님): {c.get('name')} : {src}")
+            src = None
+        c["source_page_url"] = src or None
 
 
 def score_candidates(candidates):
@@ -508,13 +543,14 @@ def write_candidates(outdir, candidates, args):
     with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["순위", "품목", "카테고리", "총점"] + labels +
-                   ["DB번호", "예상판매가(원)", "FOB시세(USD)",
+                   ["DB번호", "추천공급국", "예상판매가(원)", "FOB시세(USD)",
                     "네이버검색어", f"검색량지수({NAVER_TREND_ANCHOR}=100)", "3개월성장(%)", "전년대비(%)",
                     "규제", "위험", "선정근거", "점수근거", "영어키워드"])
         for i, c in enumerate(candidates, 1):
             n = c.get("_naver") or {}
             w.writerow([i, c["name"], c["category"], c["_total"]] + [c["scores"][k] for k, *_ in SCORE_ITEMS] +
-                       [c.get("_id"), c.get("est_retail_krw"), c.get("est_fob_usd"),
+                       [c.get("_id"), SOURCE_COUNTRIES.get(c.get("source_country"), c.get("source_country")),
+                        c.get("est_retail_krw"), c.get("est_fob_usd"),
                         ", ".join(n.get("keywords", [])), n.get("volume_idx"), n.get("growth_3m"), n.get("yoy"),
                         c.get("regulations"), c.get("risk"), c["reason"], c["score_notes"], c["search_keyword_en"]])
 
@@ -540,7 +576,7 @@ def write_candidates(outdir, candidates, args):
 <button onclick="navigator.clipboard.writeText(document.getElementById('cmd').innerText).then(()=>{{this.textContent='복사됨 ✓'}})">명령어 복사</button></section>
 <section class="card"><div class="scroll"><table><tr><th>번호</th><th>품목</th><th>카테고리</th><th>총점</th>"""
          + "".join(f"<th>{escape(l)}</th>" for l in labels)
-         + "<th>예상판매가</th><th>FOB시세</th>"
+         + "<th>추천 공급국</th><th>예상판매가</th><th>FOB시세</th>"
          + (f"<th title='최근 3개월 네이버 검색량, {escape(NAVER_TREND_ANCHOR)}=100'>검색량지수</th>"
             "<th>3개월 성장</th><th>전년 대비</th>" if has_naver else "")
          + "</tr>"]
@@ -555,8 +591,13 @@ def write_candidates(outdir, candidates, args):
             cells_n = ""
         ref = (f"<br><a class='ref' href='{escape(c['ref_url'], quote=True)}' target='_blank' rel='noopener'>참고 페이지 ↗</a>"
                if c.get("ref_url") else "")
+        if c.get("source_page_url"):
+            ref += (f"{' · ' if ref else '<br>'}<a class='ref' href='{escape(c['source_page_url'], quote=True)}' "
+                    "target='_blank' rel='noopener'>해외 판매 페이지 ↗</a>")
         H.append(f"<tr><td>{e(c.get('_id'))}</td><td class='pname'><b>{escape(c['name'])}</b>{ref}</td><td>{escape(c['category'])}</td>"
                  f"<td class='num'><b>{c['_total']}</b></td>{cells}"
+                 f"<td title='{escape(c.get('source_country_reason') or '', quote=True)}'>"
+                 f"{e(SOURCE_COUNTRIES.get(c.get('source_country'), c.get('source_country')))}</td>"
                  f"<td class='num'>{e(c.get('est_retail_krw'), '원')}</td>"
                  f"<td class='num'>{e(c.get('est_fob_usd'), ' USD')}</td>{cells_n}</tr>")
     H.append("</table></div></section><section class='card'><h2>후보별 근거</h2><ul class='notes'>")
@@ -564,6 +605,8 @@ def write_candidates(outdir, candidates, args):
         risk = f"<br><span class='flag'>⚠️ {escape(c['risk'])}</span>" if c.get("risk") else ""
         H.append(f"<li><b>[{e(c.get('_id'))}] {escape(c['name'])}</b> ({escape(c['search_keyword_en'])})<br>{escape(c['reason'])}"
                  f"<br><small>점수 근거: {escape(c['score_notes'])}</small>"
+                 f"<br><small>추천 공급국: {e(SOURCE_COUNTRIES.get(c.get('source_country'), c.get('source_country')))}"
+                 f" — {e(c.get('source_country_reason'))}</small>"
                  f"<br><small>규제: {e(c.get('regulations'))}</small>{risk}</li>")
     H.append("</ul></section></main></body></html>")
     (outdir / "candidates.html").write_text("\n".join(H), encoding="utf-8")
@@ -605,6 +648,8 @@ def main():
     ap.add_argument("--count", type=int, default=10, help="후보 품목 수 (기본 10)")
     ap.add_argument("--product", default=None,
                     help='발굴 대신 이 품목 하나만 조사·평가 (예: --product "무선 기계식 키보드 75%%"). DB에는 origin=manual')
+    ap.add_argument("--fill-country", action="store_true",
+                    help="조사 대신, 추천 공급 국가가 없는 기존 품목에 국가만 채움 (웹 검색 없이 모델 호출 1번)")
     ap.add_argument("--provider", choices=["anthropic", "openrouter"],
                     default=None,
                     help="anthropic = Claude(ANTHROPIC_API_KEY), openrouter = DeepSeek 등(OPENROUTER_API_KEY). "
@@ -635,6 +680,10 @@ def main():
             if args.hint else "")
 
     conn = trade_db.connect()
+    if args.fill_country:
+        with trade_db.agent_run(conn, "discover", provider=args.provider, model=model, args={"fill_country": True}):
+            fill_countries(backend, conn)
+        return
     with trade_db.agent_run(conn, "discover", provider=args.provider, model=model,
                             args={"product": args.product} if args.product else {"hint": args.hint, "count": args.count}) as run:
         html_path = run_discover(backend, args, today, hint, conn, run)
@@ -662,6 +711,57 @@ def product_task(product):
 - 수입에 불리한 점(인증 부담, 경쟁 포화, 마진 부족 등)도 숨기지 말고 점수와 risk에 반영합니다."""
 
 
+COUNTRY_TOOL = {
+    "name": "submit_countries",
+    "description": "품목별 추천 공급 국가를 제출합니다.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "description": "품목 번호"},
+                           "source_country": {"type": "string", "enum": list(SOURCE_COUNTRIES), "description": SOURCE_COUNTRY_DESC},
+                           "source_country_reason": {"type": "string", "description": "그 나라를 고른 이유 한 줄"}},
+            "required": ["id", "source_country", "source_country_reason"]}}},
+        "required": ["items"],
+    },
+}
+
+
+def fill_countries(backend, conn, log=print):
+    """추천 공급 국가가 없는 기존 품목에 국가만 채운다 (웹 검색 없이 모델 호출 1번 — 이미 조사한 품목 정보로 판단)."""
+    rows = conn.execute("""SELECT p.id, p.name, p.category, p.search_keyword_en, p.reason, s.est_fob_usd
+        FROM products p LEFT JOIN product_scores s ON s.id = (SELECT MAX(id) FROM product_scores WHERE product_id = p.id)
+        WHERE p.source_country IS NULL AND p.stage != 'dropped' ORDER BY p.id""").fetchall()
+    if not rows:
+        log("추천 공급 국가가 비어 있는 품목이 없습니다.")
+        return 0
+    client, model, _, _, _ = backend
+    lines = "\n".join(f"- [{r['id']}] {r['name']} ({r['search_keyword_en'] or ''}) · 카테고리 {r['category'] or '-'} · "
+                       f"FOB {r['est_fob_usd'] or '-'} USD · 근거: {(r['reason'] or '')[:200]}" for r in rows)
+    log(f"▶ 추천 공급 국가 채우기: {len(rows)}개 품목 (웹 검색 없음)")
+    msg = client.messages.create(
+        model=model, max_tokens=4000, tools=[COUNTRY_TOOL],   # 이 모델은 tool_choice 강제를 지원하지 않아 지시로 호출하게 함
+        messages=[{"role": "user", "content": "한국 1인 수입 무역용 후보 품목들입니다. 각 품목을 들여올 가장 알맞은 공급 국가를 "
+                   "China/Japan/USA 중에서 골라 반드시 submit_countries 도구 한 번으로 모든 품목을 제출하세요 (산문 답변 금지). 일본·미국 브랜드나 그 나라에서만 파는 상품이 "
+                   "아니면 보통 China입니다.\n" + lines}])
+    block = next((b for b in msg.content if b.type == "tool_use"), None)
+    if block is None:
+        raise RuntimeError("모델이 submit_countries를 호출하지 않았습니다")
+    errors = validate(block.input, COUNTRY_TOOL["input_schema"])
+    if errors:
+        raise RuntimeError("제출값 오류: " + "; ".join(errors[:5]))
+    valid = {r["id"]: r["name"] for r in rows}
+    n = 0
+    with conn:
+        for it in block.input["items"]:
+            if it["id"] in valid:
+                trade_db.upsert_product(conn, valid[it["id"]], source_country=it["source_country"],
+                                        source_country_reason=it["source_country_reason"])
+                log(f"  [{it['id']}] {valid[it['id']]} → {SOURCE_COUNTRIES[it['source_country']]} ({it['source_country_reason']})")
+                n += 1
+    return n
+
+
 def run_discover(backend, args, today, hint, conn, run):
     """후보 품목을 조사·평가해 점수표를 만들고 공용 DB에 candidate로 등록한다.
     args.product가 있으면 발굴 대신 그 품목 하나만 조사한다 (DB origin=manual)."""
@@ -685,6 +785,10 @@ def run_discover(backend, args, today, hint, conn, run):
 {criteria}
 - 국내 판매가(est_retail_krw)와 해외 FOB 단가(est_fob_usd)는 검색으로 확인한 시세로 적고, 못 찾으면 null로 둡니다.
 - ref_urls에는 사람이 어떤 물건인지 확인할 수 있는 대표 상품 페이지 주소 1~3개를 검색 결과에서 골라 적습니다.
+- source_page_url에는 조사 중 실제로 본 해외 구매처 상품 상세 페이지 1개를 적습니다 (추천 공급 국가의 판매자 우선,
+  ref_urls와 별개. 국내 쇼핑몰·검색 결과 페이지는 안 됨). 못 봤으면 null.
+- source_country에는 이 품목을 들여올 공급 국가(China/Japan/USA 중 하나)를, source_country_reason에 그 이유를 한 줄 적습니다.
+  다음 단계(공급처 발굴)가 이 나라에서 공급처를 찾습니다. FOB 시세도 그 나라 기준으로 적습니다.
 - 점수를 후하게 주지 마세요. 근거가 약하면 3점 이하로 줍니다.""", SUBMIT_CANDIDATES_TOOL,
                      review=naver_review(keys, naver_cache, allow_replace=not product) if keys else None)
     if product:
