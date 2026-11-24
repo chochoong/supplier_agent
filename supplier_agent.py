@@ -30,7 +30,11 @@ try:
     from trade_hub import db as trade_db      # 공용 DB (C:/workspace/trade_hub)
 except ImportError:
     sys.exit("trade_hub 패키지가 필요합니다:  pip install -r requirements.txt  (../trade_hub를 설치합니다)")
+import aliexpress_api as ali
 import discover_store
+import ebay_api as ebay
+import naver_shopping
+from naver_shopping import SHOP_CATEGORIES
 
 try:
     import anthropic
@@ -163,6 +167,9 @@ SUBMIT_CANDIDATES_TOOL = {
                         "keywords_ko": {"type": "array", "items": {"type": "string"},
                                         "description": "네이버 검색량 조회용 짧은 한국어 키워드 1~3개. 소비자가 실제로 "
                                                        "검색할 말로 (예: '주방 벽선반', '무타공 선반'). 첫 번째가 대표 키워드"},
+                        "shop_category": {"type": ["string", "null"], "enum": list(SHOP_CATEGORIES) + [None],
+                                          "description": "네이버쇼핑 최상위 분야 (쇼핑인사이트 클릭 추세 조회용). "
+                                                         "이 품목을 네이버쇼핑에서 찾으면 나오는 분야. 애매하면 null"},
                         "reason": {"type": "string", "description": "수요·트렌드 근거 (확인한 수치·출처 포함)"},
                         "est_retail_krw": {"type": ["number", "null"], "description": "국내 판매가 시세 (원, 중간값)"},
                         "est_fob_usd": {"type": ["number", "null"], "description": "해외 FOB 단가 시세 (USD, 중간값)"},
@@ -380,7 +387,7 @@ def _month_window(today=None):
     return months, months[0].isoformat(), end.isoformat()
 
 
-def naver_trends(groups, keys, today=None):
+def naver_trends(groups, keys, today=None, counter=None):
     """groups: {이름: [키워드...]} → {이름: {volume_idx, growth_3m, yoy}}.
     volume_idx: 최근 3개월 검색량을 기준 키워드(NAVER_TREND_ANCHOR)=100으로 환산
     growth_3m: 최근 3개월 / 직전 3개월 - 1,  yoy: 최근 3개월 / 1년 전 같은 3개월 - 1"""
@@ -393,6 +400,8 @@ def naver_trends(groups, keys, today=None):
                 "keywordGroups": [{"groupName": f"g{j}", "keywords": groups[n][:20]} for j, n in enumerate(batch)]
                 + [{"groupName": "anchor", "keywords": [NAVER_TREND_ANCHOR]}]}
         res = _naver_call(NAVER_TREND_PATH, keys, body)
+        if counter:
+            counter.count("trend")
         series = {}
         for r in res.get("results", []):
             by_period = {d["period"][:7]: d["ratio"] for d in r.get("data", [])}
@@ -409,32 +418,87 @@ def naver_trends(groups, keys, today=None):
     return out
 
 
+_NAVER_DISK = []   # 실행 중 하나만 쓰는 디스크 캐시 (같은 날 같은 키워드는 다시 안 부름)
+
+
+def naver_disk(log=print):
+    if not _NAVER_DISK:
+        _NAVER_DISK.append(naver_shopping.NaverCache(log=log))
+    return _NAVER_DISK[0]
+
+
+def _naver_auth_hint(e, api):
+    if str(e).startswith(("HTTP 401", "HTTP 403")):
+        return (f"네이버 API HUB 인증/권한 오류({e}) → 콘솔의 NAVER API HUB 애플리케이션에 '{api}' 구독이 있는지, "
+                "키가 그 애플리케이션 것인지 확인하세요.")
+    return f"네이버 {api} 조회 실패: {e}"
+
+
 def naver_lookup(candidates, keys, cache, log=print):
-    """후보별 네이버 검색어 트렌드를 조회해 cache[품목명]에 넣는다. 실패하면 None."""
+    """후보별 네이버 검색어 트렌드 + 쇼핑인사이트(분야를 고른 후보만)를 조회해 cache[품목명]에 넣는다.
+    둘 다 실패하면 None. 같은 날 같은 키워드는 디스크 캐시(data/naver_cache.json)에서 꺼낸다."""
     todo = {c["name"]: [k for k in c.get("keywords_ko", []) if k.strip()][:3] or [c["name"]]
             for c in candidates if c["name"] not in cache}
     if not todo:
         return
-    try:
-        trends = naver_trends(todo, keys)
-    except NaverError as e:
-        if str(e).startswith(("HTTP 401", "HTTP 403")):
-            log(f"    ⚠️ 네이버 API HUB 인증/권한 오류({e}) → 네이버 데이터 없이 진행합니다. "
-                "콘솔의 NAVER API HUB 애플리케이션에 '검색어 트렌드' 구독이 있는지, 키가 그 애플리케이션 것인지 확인하세요.")
-        else:
-            log(f"    ⚠️ 네이버 검색어 트렌드 조회 실패: {e}")
-        trends = {}
+    disk = naver_disk(log)
+    trends, need = {}, {}
     for name, kws in todo.items():
-        cache[name] = {"keyword": kws[0], "keywords": kws, **trends[name]} if trends.get(name) else None
+        key = "trend|" + "/".join(kws)
+        if disk.has(key):
+            trends[name] = disk.get(key)
+        else:
+            need[name] = kws
+    if need:
+        try:
+            for name, v in naver_trends(need, keys, counter=disk).items():
+                trends[name] = v
+                disk.put("trend|" + "/".join(need[name]), v)
+        except NaverError as e:
+            log("    ⚠️ " + _naver_auth_hint(e, "검색어 트렌드") + " → 검색량 없이 진행합니다.")
+    shop = {}
+    items = [(c["name"], todo[c["name"]][0], SHOP_CATEGORIES[c["shop_category"]]) for c in candidates
+             if c["name"] in todo and c.get("shop_category") in SHOP_CATEGORIES]
+    if items:
+        try:
+            shop = naver_shopping.shopping_trends(items, lambda path, body: _naver_call(path, keys, body), disk)
+        except NaverError as e:
+            log("    ⚠️ " + _naver_auth_hint(e, "쇼핑인사이트") + " → 쇼핑 클릭 추세 없이 진행합니다.")
+    disk.save()
+    picked = {c["name"]: c.get("shop_category") for c in candidates}
+    for name, kws in todo.items():
+        d = {"keyword": kws[0], "keywords": kws, **trends[name]} if trends.get(name) else None
+        if shop.get(name):
+            d = d or {"keyword": kws[0], "keywords": kws}
+            d["shopping_insight"] = shop[name]          # naver_json 안에 저장 (DB 구조 변경 없음)
+        if d is not None:   # 1번 모델이 고른 분야 (null = 모델이 애매하다고 비워 둠 → 쇼핑인사이트 조회 안 함)
+            d["shop_category"] = picked.get(name) if picked.get(name) in SHOP_CATEGORIES else None
+        cache[name] = d
 
 
 def naver_summary(name, d):
     if not d:
         return f"- {name}: 네이버 데이터 조회 실패"
     pct = lambda v: "미확인" if v is None else f"{v:+d}%"
-    vol = "미확인" if d.get("volume_idx") is None else f"{d['volume_idx']}"
-    return (f"- {name} [검색어 {', '.join(d['keywords'])}]: 검색량지수 {vol} · "
-            f"최근3개월 성장 {pct(d.get('growth_3m'))} · 전년동기 대비 {pct(d.get('yoy'))}")
+    if "volume_idx" in d:
+        vol = "미확인" if d.get("volume_idx") is None else f"{d['volume_idx']}"
+        trend = f"검색량지수 {vol} · 최근3개월 성장 {pct(d.get('growth_3m'))} · 전년동기 대비 {pct(d.get('yoy'))}"
+    else:
+        trend = "검색어 트렌드 조회 실패"
+    return f"- {name} [검색어 {', '.join(d['keywords'])}]: {trend} · {naver_shopping.summary(d.get('shopping_insight'))}"
+
+
+def shop_trend_cell(d):
+    """표·CSV용 짧은 쇼핑 클릭 추세 (예: '오름 +24% · 계절 12월')."""
+    si = (d or {}).get("shopping_insight")
+    if not si:
+        return None
+    sea = si.get("seasonal") or {}
+    season = f" · 계절 {int(sea['peak_month'][5:])}월" if sea.get("is_seasonal") else ""
+    if si.get("trend") is None:
+        return ("최근 클릭 적음" + season) if sea else "데이터 적음"
+    ch = "" if si.get("change_3m") is None else f" {si['change_3m']:+d}%"
+    return si["trend"] + ch + season
 
 
 def naver_review(keys, cache, log=print, allow_replace=True):
@@ -447,7 +511,9 @@ def naver_review(keys, cache, log=print, allow_replace=True):
         if not any(cache.get(c["name"]) for c in submitted["candidates"]):
             return None   # 전부 실패 → 재검토 없이 그대로 사용
         return (f"네이버 검색어 트렌드 실측 데이터입니다 (검색량지수는 '{NAVER_TREND_ANCHOR}'의 최근 3개월 "
-                "네이버 검색량 = 100 기준, 성장률은 직전 3개월·전년 같은 3개월 대비):\n" + "\n".join(lines) +
+                "네이버 검색량 = 100 기준, 성장률은 직전 3개월·전년 같은 3개월 대비. 쇼핑인사이트는 네이버쇼핑 그 분야 안에서의 "
+                "12개월 클릭 추세로 그 품목 수요의 오름·내림·계절성만 보여 줌 — 키워드마다 따로 조회한 상대값이라 품목끼리 "
+                "많고 적음을 비교하는 데는 쓰지 말고(비교는 검색량지수로), 가격·판매처 정보도 아님):\n" + "\n".join(lines) +
                 "\n\n이 수치를 반영해 demand 점수를 다시 검토하고(필요하면 다른 점수도), score_notes에 근거 수치를 "
                 "인용해 submit_candidates로 다시 제출하세요. " +
                 ("검색량이 거의 없는 후보는 다른 품목으로 교체해도 됩니다." if allow_replace
@@ -543,15 +609,19 @@ def write_candidates(outdir, candidates, args):
     with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["순위", "품목", "카테고리", "총점"] + labels +
-                   ["DB번호", "추천공급국", "예상판매가(원)", "FOB시세(USD)",
-                    "네이버검색어", f"검색량지수({NAVER_TREND_ANCHOR}=100)", "3개월성장(%)", "전년대비(%)",
+                   ["DB번호", "추천공급국", "예상판매가(원)", "FOB시세(USD)", "실측사이트", "실측판매가(USD)", "실측참고",
+                    "네이버검색어", f"검색량지수({NAVER_TREND_ANCHOR}=100)", "3개월성장(%)", "전년대비(%)", "쇼핑클릭추세(쇼핑인사이트)",
                     "규제", "위험", "선정근거", "점수근거", "영어키워드"])
         for i, c in enumerate(candidates, 1):
             n = c.get("_naver") or {}
             w.writerow([i, c["name"], c["category"], c["_total"]] + [c["scores"][k] for k, *_ in SCORE_ITEMS] +
                        [c.get("_id"), SOURCE_COUNTRIES.get(c.get("source_country"), c.get("source_country")),
                         c.get("est_retail_krw"), c.get("est_fob_usd"),
+                        (m := c.get("_market") or {}).get("site"),
+                        f"{m['price_min']:g}~{m['price_max']:g} (중간 {m['price_median']:g})" if m.get("count") else None,
+                        market_extra(m),
                         ", ".join(n.get("keywords", [])), n.get("volume_idx"), n.get("growth_3m"), n.get("yoy"),
+                        shop_trend_cell(n),
                         c.get("regulations"), c.get("risk"), c["reason"], c["score_notes"], c["search_keyword_en"]])
 
     def e(v, suffix=""):
@@ -560,7 +630,8 @@ def write_candidates(outdir, candidates, args):
     weights = " · ".join(f"{label} {wt*100:.0f}%" for _, label, wt, _ in SCORE_ITEMS)
     has_naver = any(c.get("_naver") for c in candidates)
     naver_note = (f"<br>네이버 데이터: 검색량지수는 최근 3개월 네이버 검색량('{escape(NAVER_TREND_ANCHOR)}'=100), "
-                  "성장률은 직전 3개월·전년 같은 기간 대비 (NAVER API HUB 검색어 트렌드)."
+                  "성장률은 직전 3개월·전년 같은 기간 대비 (NAVER API HUB 검색어 트렌드). "
+                  "쇼핑 추세는 네이버 쇼핑인사이트 그 분야 안 12개월 클릭 추세 (수요 추세만, 가격 아님)."
                   if has_naver else "")
     hint = f" · 방향: {escape(args.hint)}" if args.hint else ""
     cmd = handoff_command(candidates)
@@ -578,7 +649,9 @@ def write_candidates(outdir, candidates, args):
          + "".join(f"<th>{escape(l)}</th>" for l in labels)
          + "<th>추천 공급국</th><th>예상판매가</th><th>FOB시세</th>"
          + (f"<th title='최근 3개월 네이버 검색량, {escape(NAVER_TREND_ANCHOR)}=100'>검색량지수</th>"
-            "<th>3개월 성장</th><th>전년 대비</th>" if has_naver else "")
+            "<th>3개월 성장</th><th>전년 대비</th>"
+            "<th title='네이버 쇼핑인사이트: 그 분야 안 12개월 클릭 추세 (수요 추세만, 가격 아님)'>쇼핑 추세</th>"
+            if has_naver else "")
          + "</tr>"]
     for i, c in enumerate(candidates, 1):
         cells = "".join(f"<td class='num score s{round(c['scores'][k])}'>{e(c['scores'][k])}</td>" for k, *_ in SCORE_ITEMS)
@@ -586,7 +659,7 @@ def write_candidates(outdir, candidates, args):
             n = c.get("_naver") or {}
             g = lambda v: "미확인" if v is None else f"{v:+d}%"
             cells_n = (f"<td class='num'>{e(n.get('volume_idx'))}</td><td class='num'>{g(n.get('growth_3m'))}</td>"
-                       f"<td class='num'>{g(n.get('yoy'))}</td>")
+                       f"<td class='num'>{g(n.get('yoy'))}</td><td>{e(shop_trend_cell(n))}</td>")
         else:
             cells_n = ""
         ref = (f"<br><a class='ref' href='{escape(c['ref_url'], quote=True)}' target='_blank' rel='noopener'>참고 페이지 ↗</a>"
@@ -650,6 +723,11 @@ def main():
                     help='발굴 대신 이 품목 하나만 조사·평가 (예: --product "무선 기계식 키보드 75%%"). DB에는 origin=manual')
     ap.add_argument("--fill-country", action="store_true",
                     help="조사 대신, 추천 공급 국가가 없는 기존 품목에 국가만 채움 (웹 검색 없이 모델 호출 1번)")
+    ap.add_argument("--fill-shop", action="store_true",
+                    help="조사 대신, 기존 품목에 네이버 쇼핑인사이트(수요 추세)를 채움 (분야 고르기 모델 호출 1번 + 네이버 조회, "
+                         "점수는 그대로)")
+    ap.add_argument("--ali-ideas", action="store_true",
+                    help="AliExpress 드롭쉬핑 인기 상품(해외 판매량 상위)을 발굴 아이디어로 함께 줌. .env의 DISCOVER_ALI_IDEAS=1로도 켬")
     ap.add_argument("--provider", choices=["anthropic", "openrouter"],
                     default=None,
                     help="anthropic = Claude(ANTHROPIC_API_KEY), openrouter = DeepSeek 등(OPENROUTER_API_KEY). "
@@ -667,6 +745,8 @@ def main():
             ap.error("--product에 품목명을 적어 주세요")
     # 스크립트 폴더의 .env를 읽음 (작업 스케줄러처럼 다른 폴더에서 실행돼도 찾도록)
     load_dotenv(Path(__file__).resolve().parent / ".env")
+    if not args.ali_ideas:   # 대시보드·슈퍼바이저 실행에도 켜지게 .env로 기본값
+        args.ali_ideas = os.environ.get("DISCOVER_ALI_IDEAS", "").strip().lower() in ("1", "true", "yes", "on")
     if args.provider is None:
         args.provider = os.environ.get("PROVIDER", "anthropic").strip().lower()
         if args.provider not in ("anthropic", "openrouter"):
@@ -684,8 +764,16 @@ def main():
         with trade_db.agent_run(conn, "discover", provider=args.provider, model=model, args={"fill_country": True}):
             fill_countries(backend, conn)
         return
+    if args.fill_shop:
+        keys = naver_keys()
+        if not keys:
+            sys.exit(".env에 NAVER_CLIENT_ID / NAVER_CLIENT_SECRET이 없어 쇼핑인사이트를 조회할 수 없습니다.")
+        with trade_db.agent_run(conn, "discover", provider=args.provider, model=model, args={"fill_shop": True}):
+            fill_shop_insight(backend, conn, keys)
+        return
     with trade_db.agent_run(conn, "discover", provider=args.provider, model=model,
-                            args={"product": args.product} if args.product else {"hint": args.hint, "count": args.count}) as run:
+                            args={"product": args.product} if args.product else
+                            {"hint": args.hint, "count": args.count, **({"ali_ideas": True} if args.ali_ideas else {})}) as run:
         html_path = run_discover(backend, args, today, hint, conn, run)
     if not args.no_open:
         import webbrowser
@@ -762,6 +850,232 @@ def fill_countries(backend, conn, log=print):
     return n
 
 
+SHOP_CATEGORY_TOOL = {
+    "name": "submit_shop_categories",
+    "description": "품목별 네이버쇼핑 최상위 분야를 제출합니다.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "description": "품목 번호"},
+                           "shop_category": {"type": ["string", "null"], "enum": list(SHOP_CATEGORIES) + [None],
+                                             "description": "이 품목을 네이버쇼핑에서 찾으면 나오는 최상위 분야. 애매하면 null"}},
+            "required": ["id", "shop_category"]}}},
+        "required": ["items"],
+    },
+}
+
+
+def _latest_scores(conn):
+    """중단하지 않은 품목마다 가장 최근 점수 줄 (naver_json 포함)."""
+    return conn.execute("""SELECT p.id, p.name, p.category, p.search_keyword_en, p.keywords_ko_json,
+               s.id AS score_id, s.naver_json
+        FROM products p JOIN product_scores s ON s.id = (SELECT MAX(id) FROM product_scores WHERE product_id = p.id)
+        WHERE p.stage != 'dropped' ORDER BY p.id""").fetchall()
+
+
+def fill_shop_insight(backend, conn, keys, log=print):
+    """기존 품목에 네이버 쇼핑인사이트(수요 추세)를 뒤늦게 채운다.
+    1) 분야(shop_category)를 아직 안 정한 품목만 골라 모델 호출 1번으로 분야를 정하고 (웹 검색 없음)
+    2) 쇼핑인사이트를 조회해 가장 최근 점수 줄의 naver_json에 shop_category·shopping_insight를 더한다.
+    이미 검색어 트렌드가 있는 줄은 그 값(점수 근거)을 건드리지 않고 두 칸만 더하고,
+    naver_json이 비어 있던 줄(네이버 연동 전 품목)은 검색어 트렌드도 함께 채운다. 점수·순위는 바꾸지 않는다."""
+    rows = [r for r in _latest_scores(conn)
+            if "shop_category" not in json.loads(r["naver_json"] or "{}")]
+    if not rows:
+        log("쇼핑 분야를 아직 정하지 않은 품목이 없습니다.")
+        return 0
+    client, model, _, _, _ = backend
+    lines = "\n".join(f"- [{r['id']}] {r['name']} ({r['search_keyword_en'] or ''}) · 카테고리 {r['category'] or '-'}"
+                      for r in rows)
+    log(f"▶ 쇼핑인사이트 채우기: {len(rows)}개 품목 (분야 고르기 모델 호출 1번, 웹 검색 없음)")
+    msg = client.messages.create(
+        model=model, max_tokens=4000, tools=[SHOP_CATEGORY_TOOL],
+        messages=[{"role": "user", "content": "한국 1인 수입 무역용 후보 품목들입니다. 각 품목을 네이버쇼핑에서 찾으면 나오는 "
+                   "최상위 분야를 다음 중에서 골라 반드시 submit_shop_categories 도구 한 번으로 모든 품목을 제출하세요 "
+                   "(산문 답변 금지). 애매하면 null.\n분야: " + ", ".join(SHOP_CATEGORIES) + "\n" + lines}])
+    block = next((b for b in msg.content if b.type == "tool_use"), None)
+    if block is None:
+        raise RuntimeError("모델이 submit_shop_categories를 호출하지 않았습니다")
+    errors = validate(block.input, SHOP_CATEGORY_TOOL["input_schema"])
+    if errors:
+        raise RuntimeError("제출값 오류: " + "; ".join(errors[:5]))
+    picked = {it["id"]: it["shop_category"] for it in block.input["items"]}
+    cands, by_name = [], {}
+    for r in rows:
+        if r["id"] not in picked:
+            continue
+        old = json.loads(r["naver_json"] or "null")
+        kws = (old or {}).get("keywords") or json.loads(r["keywords_ko_json"] or "[]") or [r["name"]]
+        cands.append({"name": r["name"], "keywords_ko": kws, "shop_category": picked[r["id"]]})
+        by_name[r["name"]] = (r, old)
+    cache = {}
+    naver_lookup(cands, keys, cache, log)
+    n = 0
+    with conn:
+        for name, (r, old) in by_name.items():
+            got = cache.get(name)
+            if got is None or (got.get("shop_category") and not got.get("shopping_insight")):
+                log(f"  [{r['id']}] {name}: 네이버 조회 실패 → 기록하지 않음 (다음 --fill-shop 때 다시 시도)")
+                continue
+            if old:   # 기존 검색어 트렌드(점수 근거)는 그대로, 두 칸만 더함
+                new = {**old, "shop_category": got.get("shop_category")}
+                if got.get("shopping_insight"):
+                    new["shopping_insight"] = got["shopping_insight"]
+            else:
+                new = got
+            conn.execute("UPDATE product_scores SET naver_json = ? WHERE id = ?",
+                         (json.dumps(new, ensure_ascii=False), r["score_id"]))
+            log(f"  [{r['id']}] {name} → {new.get('shop_category') or '분야 미정'} · "
+                f"{shop_trend_cell(new) or ('조회 안 함' if not new.get('shop_category') else '데이터 없음')}")
+            n += 1
+    log(f"  · {n}개 품목에 채움")
+    return n
+
+
+# 추천 국가별 '상품 상세 페이지'를 찾을 검색 예시 (검색 결과에서 상세 주소를 고르게)
+SOURCE_SEARCH_EXAMPLES = {
+    "China": '"alibaba.com product-detail <영문 키워드>" 또는 "aliexpress.com item <영문 키워드>"',
+    "Japan": '"item.rakuten.co.jp <일본어 키워드>" 또는 "amazon.co.jp <일본어 키워드>"',
+    "USA": '"ebay.com itm <영문 키워드>" 또는 "amazon.com <영문 키워드>"',
+}
+SOURCE_SEARCHES_PER_CANDIDATE = 1   # 후보마다 해외 상품 상세 페이지 확인용 검색 1회 (기본 15회에 더함)
+
+
+def existing_products(conn):
+    """이미 DB에 있는 품목 이름 (후보·진행·중단 모두). 발굴이 같은 품목을 다시 찾아오지 않게 프롬프트에 넣는다."""
+    return [r["name"] for r in conn.execute("SELECT name FROM products ORDER BY id")]
+
+
+def exclusion_block(names):
+    if not names:
+        return ""
+    return ("\n- 아래는 이미 조사한 품목입니다 (후보·진행 중·중단 포함). 이것과 같은 품목은 다시 고르지 마세요. "
+            "이름·소재·색상·구성만 조금 다른 것도 같은 품목으로 봅니다 (예: '실리콘 찜기'와 '접이식 실리콘 찜기 바스켓'). "
+            "점수 재검토로 후보를 교체할 때도 마찬가지입니다.\n"
+            + "\n".join(f"  · {n}" for n in names))
+
+
+def with_more_searches(backend, extra_uses):
+    """웹 검색 도구의 max_uses만 늘린 backend (원본 dict는 그대로)."""
+    client, model, tool, extra, name = backend
+    tool = dict(tool)
+    if "parameters" in tool:   # OpenRouter
+        tool["parameters"] = {**tool["parameters"], "max_uses": tool["parameters"].get("max_uses", 15) + extra_uses}
+    else:
+        tool["max_uses"] = tool.get("max_uses", 15) + extra_uses
+    return client, model, tool, extra, name
+
+
+# 추천 공급 국가별 실측 사이트: 국가 → (이름, 모듈, 이 사이트 가격의 성격). 모듈은 status/search/summarize/summary_text
+MARKETS = {
+    "China": ("AliExpress", ali, "한국 배송 기준 낱개 소매가 USD — 공장 도매가(FOB)는 보통 이보다 낮음"),
+    "USA": ("eBay", ebay, "미국 내 판매자의 새 상품 즉시 구매가 USD — 미국 배대지까지 배송비·국제 배송비 별도"),
+}
+MARKET_ERRORS = (ali.AliError, ebay.EbayError)
+
+
+def market_key(c):
+    """(추천 국가, 영문 키워드). 실측 사이트가 없는 국가(일본 등)나 키워드가 없으면 None."""
+    kw = (c.get("search_keyword_en") or "").strip()
+    return (c.get("source_country"), kw) if c.get("source_country") in MARKETS and kw else None
+
+
+def market_status():
+    """{국가: (사용 가능, 이유)}"""
+    return {country: mod.status() for country, (_, mod, _) in MARKETS.items()}
+
+
+def market_lookup(candidates, cache, enabled, log=print):
+    """추천 국가의 실측 사이트에서 영문 키워드로 검색해 cache[(국가, 키워드)]에 요약을 넣는다 (같은 키워드는 한 번만).
+    enabled = 쓸 수 있는 국가들. 실패하면 None을 넣고 넘어간다."""
+    for c in candidates:
+        k = market_key(c)
+        if not k or k[0] not in enabled or k in cache:
+            continue
+        name, mod, _ = MARKETS[k[0]]
+        try:
+            total, items = mod.search(k[1])
+            cache[k] = mod.summarize(k[1], total, items)
+        except MARKET_ERRORS as e:
+            log(f"    · {name} 조회 실패 ({k[1]}): {e}")
+            cache[k] = None
+    return cache
+
+
+def market_review_text(candidates, cache):
+    parts = []
+    for country, (name, mod, basis) in MARKETS.items():
+        lines = [f"- {c['name']}: {mod.summary_text(cache[k])}" for c in candidates
+                 if (k := market_key(c)) and k[0] == country and cache.get(k) is not None]
+        if lines:
+            parts.append(f"{name} 실측 데이터입니다 ({SOURCE_COUNTRIES[country]} 추천 후보, {basis}):\n" + "\n".join(lines))
+    if not parts:
+        return None
+    return ("\n\n".join(parts)
+            + "\n이 수치로 margin(해외 판매가가 국내 판매가에 가까우면 마진 여지가 작음)과 competition(같은 상품·판매자·주문이 "
+              "많으면 이미 해외직구로 많이 팔리는 중)을 검토하고 score_notes에 근거 수치를 인용하세요. "
+              "이 소매가를 est_fob_usd에 그대로 넣지 마세요.")
+
+
+def combined_review(naver_rev, cache, enabled, log=print, allow_replace=True):
+    """제출 후 해외 실측(AliExpress·eBay)과 네이버 검색어 트렌드를 한 번에 보여 주고 다시 제출받는 review 함수."""
+    def review(submitted):
+        market_t = None
+        if enabled:
+            log("    🛒 해외 판매 실측 조회 중 (" + ", ".join(MARKETS[c][0] for c in enabled) + ")...")
+            market_lookup(submitted["candidates"], cache, enabled, log)
+            market_t = market_review_text(submitted["candidates"], cache)
+        naver_t = naver_rev(submitted) if naver_rev else None
+        if naver_t:                          # 네이버 안내문 끝에 재제출 지시가 있음
+            return f"{market_t}\n\n{naver_t}" if market_t else naver_t
+        if market_t:
+            return market_t + " 반영해 submit_candidates로 다시 제출하세요." + (
+                "" if allow_replace else " 사용자가 지정한 품목이므로 품목은 바꾸지 말고 점수와 근거만 고치세요.")
+        return None
+    return review
+
+
+def apply_market(candidates, cache):
+    """최종 후보에 실측 요약을 붙이고(점수 근거에 한 줄), 해외 판매 페이지가 비었으면 검색 결과 상품 주소로 채운다.
+    {사이트 이름: 채운 개수}를 돌려준다."""
+    filled = {}
+    for c in candidates:
+        k = market_key(c)
+        s = cache.get(k) if k else None
+        c["_market"] = {"site": MARKETS[k[0]][0], **s} if s else None
+        if not s or not s.get("count"):
+            continue
+        name, mod, _ = MARKETS[k[0]]
+        note = f"[{name} 실측] " + mod.summary_text(s)
+        if note not in (c.get("score_notes") or ""):
+            c["score_notes"] = " / ".join(x for x in (c.get("score_notes"), note) if x)
+        if not c.get("source_page_url") and s.get("page_url"):
+            c["source_page_url"] = s["page_url"]
+            c["_source_page_from"] = name
+            filled[name] = filled.get(name, 0) + 1
+    return filled
+
+
+def market_extra(m):
+    """CSV '실측참고' 칸: AliExpress는 최다 주문, eBay는 판매자 수."""
+    if not m or not m.get("count"):
+        return None
+    if "top_orders" in m:
+        return f"최다 주문 {m['top_orders']:,}건"
+    if "sellers" in m:
+        return f"판매자 {m['sellers']}명"
+    return None
+
+
+def ali_ideas_block(items):
+    lines = "\n".join(f"  · [{i['category']}] {i['title'][:80]} · ${i['price']:g} · 최근 판매 {i['volume']:,}건"
+                      for i in items)
+    return ("\n- 참고: AliExpress 드롭쉬핑 인기 상품 목록입니다 (전 세계 판매량 기준이라 한국 수요와 다를 수 있음). "
+            "이 중 네이버·쿠팡에서 한국 수요가 확인되고 국내 경쟁이 적은 품목이 있으면 후보로 검토하세요. "
+            "브랜드 가품·라이선스 캐릭터 상품은 제외합니다. 맞는 것이 없으면 쓰지 않아도 됩니다. 이 목록에서 고른 후보는 reason 앞에 '[알리 인기]'를 붙입니다.\n" + lines)
+
+
 def run_discover(backend, args, today, hint, conn, run):
     """후보 품목을 조사·평가해 점수표를 만들고 공용 DB에 candidate로 등록한다.
     args.product가 있으면 발굴 대신 그 품목 하나만 조사한다 (DB origin=manual)."""
@@ -774,23 +1088,52 @@ def run_discover(backend, args, today, hint, conn, run):
     keys, naver_cache = naver_keys(), {}
     print("  · 네이버 실측 데이터: " + ("사용 (제출 후 네이버 검색어 트렌드로 점수 재검토)" if keys
                                    else "사용 안 함 (.env에 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET 없음)"))
+    known = [] if product else existing_products(conn)
+    if known:
+        print(f"  · 이미 조사한 품목 {len(known)}개는 제외하고 새 품목을 찾습니다")
+    st = market_status()
+    enabled = [country for country, (ok, _) in st.items() if ok]
+    market_cache, ideas = {}, ""
+    for country, (ok, why) in st.items():
+        name = MARKETS[country][0]
+        print(f"  · {name} 실측: " + (f"사용 ({SOURCE_COUNTRIES[country]} 추천 후보의 실제 판매가·상품 페이지 확인)" if ok
+                                     else f"사용 안 함 ({why})"))
+    ali_ok, ali_why = st["China"]
+    if not product and getattr(args, "ali_ideas", False):
+        try:
+            if not ali_ok:
+                raise ali.AliError(ali_why)
+            top = ali.bestsellers()
+            ideas = ali_ideas_block(top)
+            print(f"  · AliExpress 인기 상품 {len(top)}개를 발굴 아이디어로 전달")
+        except ali.AliError as e:
+            print(f"  · AliExpress 인기 상품 목록 사용 안 함 ({e})")
     task = product_task(product) if product else f"""{hint}
 한국 시장의 최근 소비 트렌드, 네이버·쿠팡 인기 카테고리와 리뷰 수, 해외(아마존·틱톡 등) 트렌드, 해외직구 인기 품목,
 다가오는 시즌 수요를 조사해서 "수요는 있는데 공급(경쟁)이 적은"
 1인 수입 무역 후보 품목 {args.count}개를 골라 submit_candidates로 제출하세요.
-- 서로 겹치지 않는 품목으로 고릅니다 (같은 품목의 색상·사이즈 변형은 하나로 봅니다)."""
+- 서로 겹치지 않는 품목으로 고릅니다 (같은 품목의 색상·사이즈 변형은 하나로 봅니다).{exclusion_block(known)}{ideas}"""
+    n_cand = 1 if product else args.count
+    backend = with_more_searches(backend, SOURCE_SEARCHES_PER_CANDIDATE * n_cand)
+    source_examples = "\n".join(f"    {SOURCE_COUNTRIES[k]}: {v}" for k, v in SOURCE_SEARCH_EXAMPLES.items())
     data = run_agent(backend, f"""오늘은 {today}입니다.
 {task}
 - 각 후보를 아래 5개 항목에 대해 1~5점(5가 가장 유리)으로 평가하고 score_notes에 항목별 근거를 한 줄씩 적습니다.
 {criteria}
 - 국내 판매가(est_retail_krw)와 해외 FOB 단가(est_fob_usd)는 검색으로 확인한 시세로 적고, 못 찾으면 null로 둡니다.
 - ref_urls에는 사람이 어떤 물건인지 확인할 수 있는 대표 상품 페이지 주소 1~3개를 검색 결과에서 골라 적습니다.
-- source_page_url에는 조사 중 실제로 본 해외 구매처 상품 상세 페이지 1개를 적습니다 (추천 공급 국가의 판매자 우선,
-  ref_urls와 별개. 국내 쇼핑몰·검색 결과 페이지는 안 됨). 못 봤으면 null.
+- source_page_url에는 해외 구매처의 상품 상세 페이지 1개를 적습니다 (ref_urls와 별개). 다음 단계가 이 판매자를 첫 후보로 검증합니다.
+  후보를 정한 뒤 후보마다 추천 공급 국가의 구매 사이트를 한 번 검색해서, 검색 결과 중 상품 상세 주소
+  (alibaba.com/product-detail/…, item.rakuten.co.jp/…, ebay.com/itm/… 등)를 고릅니다. 검색 예:
+{source_examples}
+  국내 쇼핑몰·검색 결과 목록·카테고리 페이지는 안 됩니다. 검색해도 상세 주소가 없으면 null (지어내지 말 것).
+- shop_category에는 이 품목이 네이버쇼핑에서 속하는 최상위 분야를 고릅니다 (쇼핑 클릭 추세 조회용, 애매하면 null).
 - source_country에는 이 품목을 들여올 공급 국가(China/Japan/USA 중 하나)를, source_country_reason에 그 이유를 한 줄 적습니다.
   다음 단계(공급처 발굴)가 이 나라에서 공급처를 찾습니다. FOB 시세도 그 나라 기준으로 적습니다.
 - 점수를 후하게 주지 마세요. 근거가 약하면 3점 이하로 줍니다.""", SUBMIT_CANDIDATES_TOOL,
-                     review=naver_review(keys, naver_cache, allow_replace=not product) if keys else None)
+                     review=combined_review(naver_review(keys, naver_cache, allow_replace=not product) if keys else None,
+                                            market_cache, enabled, allow_replace=not product)
+                     if (keys or enabled) else None)
     if product:
         data["candidates"] = data["candidates"][:1]
     if keys:   # 재제출 때 교체된 후보도 조회
@@ -798,6 +1141,10 @@ def run_discover(backend, args, today, hint, conn, run):
     for c in data["candidates"]:
         c["_naver"] = naver_cache.get(c["name"])
     set_ref_url(data["candidates"])
+    if enabled:
+        market_lookup(data["candidates"], market_cache, enabled)          # 재검토 때 교체된 후보도
+        for name, n in apply_market(data["candidates"], market_cache).items():
+            print(f"  · 해외 판매 페이지 {n}개를 {name} 검색 결과로 채움")
     candidates = score_candidates(data["candidates"])
     outdir = new_outdir(args.out, "_product" if product else "_discover")
     run.report_dir = str(outdir.resolve())
