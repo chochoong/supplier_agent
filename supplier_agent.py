@@ -218,6 +218,7 @@ _TYPE_CHECKS = {
     "string": lambda v: isinstance(v, str),
     "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
     "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
     "null": lambda v: v is None,
 }
 
@@ -726,6 +727,11 @@ def main():
     ap.add_argument("--fill-shop", action="store_true",
                     help="조사 대신, 기존 품목에 네이버 쇼핑인사이트(수요 추세)를 채움 (분야 고르기 모델 호출 1번 + 네이버 조회, "
                          "점수는 그대로)")
+    ap.add_argument("--reprice", action="store_true",
+                    help="조사 대신, 진행 중 품목(+ --ids)의 국내 실제 판매가·낱개/묶음 기준을 다시 조사하고 "
+                         "판매가가 크게 다른 변형은 별도 후보 품목으로 나눔 (품목마다 웹 검색)")
+    ap.add_argument("--ids", default="", help="--reprice에 더할 품목 번호. 예: --ids 16,34,44")
+    ap.add_argument("--only-ids", action="store_true", help="--reprice를 --ids 품목만 (실패한 품목 다시 조사용)")
     ap.add_argument("--ali-ideas", action="store_true",
                     help="AliExpress 드롭쉬핑 인기 상품(해외 판매량 상위)을 발굴 아이디어로 함께 줌. .env의 DISCOVER_ALI_IDEAS=1로도 켬")
     ap.add_argument("--provider", choices=["anthropic", "openrouter"],
@@ -763,6 +769,16 @@ def main():
     if args.fill_country:
         with trade_db.agent_run(conn, "discover", provider=args.provider, model=model, args={"fill_country": True}):
             fill_countries(backend, conn)
+        return
+    if args.reprice:
+        import reprice
+        try:
+            ids = [int(x) for x in args.ids.replace(" ", "").split(",") if x]
+        except ValueError:
+            ap.error("--ids는 쉼표로 나눈 품목 번호여야 합니다 (예: 16,34,44)")
+        with trade_db.agent_run(conn, "discover", provider=args.provider, model=model,
+                                args={"reprice": True, "ids": ids, "only_ids": args.only_ids}) as run:
+            reprice.run(backend, conn, run, ids, args.out, only_ids=args.only_ids)
         return
     if args.fill_shop:
         keys = naver_keys()
