@@ -19,6 +19,7 @@ from supplier_agent import trade_db
 SPLIT_PRICE_RATIO = 1.5      # 변형끼리 대표 판매가가 이 배 이상 차이 나면 나눔 (4번 요청: '판매가가 크게 다른 변형')
 MAX_VARIANTS = 4
 TAG = "1번 시세"             # notes 태그: '[1번 시세 2026-11-24] ...' 한 줄
+MIXED = "[변형 혼합]"        # 나눈 원래 품목의 notes 첫 줄 맨 앞 (4번이 마진 계산에서 구분, 2026-11-24 4번 요청)
 
 REPRICE_TOOL = {
     "name": "submit_retail",
@@ -125,7 +126,8 @@ def tag_line(v, today, extra=""):
 
 def with_tag(notes, line):
     """notes 맨 앞의 '[1번 시세 ...]' 줄만 바꾸고 사람이 적은 메모는 그대로 둔다."""
-    kept = [x for x in (notes or "").splitlines() if not x.startswith(f"[{TAG} ")]
+    kept = [x for x in (notes or "").splitlines()
+            if not x.startswith((f"[{TAG} ", f"{MIXED} [{TAG} "))]
     return "\n".join([line, *kept]).strip()
 
 
@@ -176,7 +178,7 @@ def apply(conn, row, data, run_id, today, log=print):
         return {"id": pid, "split": True, "made": []}
     summary = ", ".join((f"#{i} {v['basis']} {v['est_retail_krw']:,}원" if v.get("est_retail_krw") is not None
                          else f"#{i} 미확인") + (" (기존 품목)" if old else "") for i, _, v, old in made)
-    line = f"[{TAG} {today}] 판매가가 다른 변형이 섞여 있어 나눔 → {summary} · 이 품목의 판매가는 변형 혼합 (단계·공급처는 그대로)"
+    line = f"{MIXED} [{TAG} {today}] 판매가가 다른 변형이 섞여 있어 나눔 → {summary} · 이 품목의 판매가는 변형 혼합 (단계·공급처는 그대로)"
     trade_db.upsert_product(conn, row["name"], run_id, notes=with_tag(row["notes"], line))
     conn.execute("INSERT INTO product_events (product_id, run_id, from_stage, to_stage, note) VALUES (?, ?, ?, ?, ?)",
                  (pid, run_id, row["stage"], row["stage"], "1번: 변형별로 나눔 → " + ", ".join(f"#{i}" for i, _, _, _ in made)))

@@ -72,6 +72,9 @@ class RepriceTest(unittest.TestCase):
         orig = self.product(self.clicker)
         self.assertEqual((orig["stage"], orig["est_retail_krw"]), ("sourcing", 4000))           # 단계·판매가 그대로
         self.assertIn("나눔 → #", orig["notes"])
+        self.assertTrue(orig["notes"].startswith("[변형 혼합] [1번 시세 2026-11-24]"))
+        redo = reprice.with_tag(orig["notes"], "[1번 시세 2026-12-01] 낱개 기준")                # 다시 조사하면 바뀜
+        self.assertEqual(redo, "[1번 시세 2026-12-01] 낱개 기준\n사장님 메모: 샘플 먼저")
         self.assertTrue(orig["notes"].endswith("사장님 메모: 샘플 먼저"))
         for pid, price in zip(made, (3500, 11000)):
             p = self.product(pid)
