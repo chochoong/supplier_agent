@@ -683,7 +683,8 @@ MAP_STYLE = """
 """
 
 
-def write_candidates(outdir, candidates, args):
+def write_candidates(outdir, candidates, args, when=None):
+    when = when or datetime.now()                                       # 예전 리포트를 다시 그릴 때는 원래 시각
     from html import escape
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "raw.json").write_text(
@@ -721,10 +722,10 @@ def write_candidates(outdir, candidates, args):
     cmd = handoff_command(candidates)
     H = [f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>후보 품목 {datetime.now():%Y-%m-%d}</title><style>{HTML_STYLE}
+<title>후보 품목 {when:%Y-%m-%d}</title><style>{HTML_STYLE}
 .ref{{font-size:12px}}.pname{{min-width:220px}}.score{{font-weight:700}}.s5,.s4{{color:var(--good)}}.s3{{color:var(--mid)}}.s2,.s1{{color:var(--bad)}}{MAP_STYLE}</style></head><body><main>
 <h1>후보 품목 점수표</h1>
-<p class="sub">{datetime.now():%Y-%m-%d %H:%M}{hint} · 총점 가중치: {weights}<br>
+<p class="sub">{when:%Y-%m-%d %H:%M}{hint} · 총점 가중치: {weights}<br>
 각 항목 1~5점(5가 유리). 판매가·FOB 시세는 웹 검색 기준 참고값입니다.{naver_note}</p>
 <section class="card"><h2>다음 단계</h2><p>진행할 품목의 <b>번호</b>를 골라 공급처 발굴 단계로 넘기세요 (공용 DB에서 sourcing 단계로 이동). 상위 3개 예:</p>
 <pre id="cmd">{escape(cmd)}</pre>
