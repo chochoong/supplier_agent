@@ -134,7 +134,7 @@ def shopping_trends(items, call, cache, today=None):
                 got[r.get("title")] = [float(by.get(m.isoformat()[:7], 0.0)) for m in months]
             for j, (name, kw, key) in enumerate(batch):
                 info = {"cid": cid, "category": next((k for k, v in SHOP_CATEGORIES.items() if v == cid), cid),
-                        "keyword": kw, **analyze(got.get(f"k{j}", [0.0] * len(months)), months)}
+                        "keyword": kw, "checked_at": (today or date.today()).isoformat(), **analyze(got.get(f"k{j}", [0.0] * len(months)), months)}
                 cache.put(key, info)
                 out[name] = info
     return out

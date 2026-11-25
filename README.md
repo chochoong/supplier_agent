@@ -81,7 +81,9 @@ python supplier_agent.py --count 5 --provider openrouter
    해외 실측: 중국 추천 후보는 AliExpress(소매가·주문 수), 미국 추천 후보는 eBay(미국 내 새 상품 판매가·판매자 수)를
    영문 키워드로 검색해 함께 보여 줌 (마진·경쟁 재검토). 해외 판매 페이지를 못 찾은 후보는 그 검색 결과의 상품 주소로 채우고,
    점수 근거에 `[AliExpress 실측]`·`[eBay 실측]` 한 줄을 남김 (일본 추천 후보는 실측 사이트 없음)
-3. 총점(100점 만점) 순으로 정렬해 `reports/날짜_시간_discover/`에 `candidates.html`·`candidates.csv`·`raw.json` 저장
+3. 총점(100점 만점) 순으로 정렬해 `reports/날짜_시간_discover/`에 `candidates.html`·`candidates.csv`·`raw.json` 저장.
+   `candidates.html`의 표 아래 **후보 지도**: 가로 검색량지수(로그 눈금)·세로 총점, 점 크기 = 마진 여지 점수, 점 색 = 쇼핑 클릭 추세.
+   점에 마우스를 올리면 수치, 누르면 표의 그 줄로 이동 (검색량을 모르는 후보는 지도 아래에 이름만)
 4. 공용 DB(trade_hub)에 후보 품목(`stage=candidate`)과 점수를 기록 (점수표의 **번호** = DB 품목 번호)
 
 점수는 모델의 판단이고 판매가·FOB 시세는 웹 검색 기준 참고값입니다. 검색량은 판매량이 아닙니다.

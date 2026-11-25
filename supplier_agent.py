@@ -468,9 +468,10 @@ def naver_lookup(candidates, keys, cache, log=print):
     disk.save()
     picked = {c["name"]: c.get("shop_category") for c in candidates}
     for name, kws in todo.items():
-        d = {"keyword": kws[0], "keywords": kws, **trends[name]} if trends.get(name) else None
+        d = ({"keyword": kws[0], "keywords": kws, "checked_at": disk.today, **trends[name]}   # checked_at = 네이버 조회일
+             if trends.get(name) else None)
         if shop.get(name):
-            d = d or {"keyword": kws[0], "keywords": kws}
+            d = d or {"keyword": kws[0], "keywords": kws, "checked_at": disk.today}
             d["shopping_insight"] = shop[name]          # naver_json 안에 저장 (DB 구조 변경 없음)
         if d is not None:   # 1번 모델이 고른 분야 (null = 모델이 애매하다고 비워 둠 → 쇼핑인사이트 조회 안 함)
             d["shop_category"] = picked.get(name) if picked.get(name) in SHOP_CATEGORIES else None
@@ -600,6 +601,88 @@ def handoff_command(candidates, n=3):
     return f"trade_hub select {ids}"
 
 
+TREND_COLOR = {"오름": "var(--good)", "보합": "var(--mid)", "내림": "var(--bad)"}
+
+
+def candidate_map(candidates):
+    """후보 지도: 가로 = 검색량지수(로그 눈금), 세로 = 총점, 점 크기 = 마진 여지 점수, 점 색 = 쇼핑 클릭 추세.
+    파일로 열어도 보이게 외부 라이브러리 없이 인라인 SVG. 검색량을 모르는 후보는 아래에 이름만 적는다."""
+    from html import escape
+    import math
+    pts = [c for c in candidates if isinstance((c.get("_naver") or {}).get("volume_idx"), (int, float))]
+    if len(pts) < 2:
+        return ""
+    W, H, L, R, T, B = 720, 360, 44, 24, 28, 48
+    PAD = 14                                                             # 축 바로 위에 점이 붙지 않게
+    vol = lambda c: max(c["_naver"]["volume_idx"], 0.01)                 # 0은 로그 눈금에 못 찍어 0.01로
+    lo, hi = math.floor(math.log10(min(map(vol, pts)))), math.ceil(math.log10(max(map(vol, pts))))
+    hi = hi if hi > lo else lo + 1
+    ymin = max(0, (min(c["_total"] for c in pts) - 5) // 10 * 10)
+    ymax = min(100, -(-(max(c["_total"] for c in pts) + 5) // 10) * 10)
+    sx = lambda v: L + PAD + (math.log10(v) - lo) / (hi - lo) * (W - L - R - PAD)
+    sy = lambda v: T + (ymax - v) / (ymax - ymin) * (H - T - B)
+    med = lambda xs: sorted(xs)[len(xs) // 2]
+    mx, my = sx(med([vol(c) for c in pts])), sy(med([c["_total"] for c in pts]))
+    g = [f'<rect x="{mx:.1f}" y="{T}" width="{W - R - mx:.1f}" height="{my - T:.1f}" fill="var(--good)" opacity=".07"/>',
+         f'<text x="{W - R - 6}" y="{T + 14}" text-anchor="end" class="mlab">검색량·점수 모두 중간 이상</text>']
+    for p in range(lo, hi + 1):                                         # 세로 눈금선: 10의 거듭제곱
+        x = sx(10 ** p)
+        g.append(f'<line x1="{x:.1f}" x2="{x:.1f}" y1="{T}" y2="{H - B}" class="grid"/>'
+                 f'<text x="{x:.1f}" y="{H - B + 16}" text-anchor="middle" class="tick">{10 ** p:g}</text>')
+    for v in range(int(ymin), int(ymax) + 1, 10):
+        y = sy(v)
+        g.append(f'<line x1="{L}" x2="{W - R}" y1="{y:.1f}" y2="{y:.1f}" class="grid"/>'
+                 f'<text x="{L - 6}" y="{y + 4:.1f}" text-anchor="end" class="tick">{v}</text>')
+    g.append(f'<text x="{(L + W - R) / 2}" y="{H - 8}" text-anchor="middle" class="axis">'
+             f'검색량지수 ({escape(NAVER_TREND_ANCHOR)}=100, 로그 눈금) →</text>'
+             f'<text x="{L - 6}" y="{T - 12}" text-anchor="end" class="axis">총점 ↑</text>')
+    placed = []                                                          # 번호 글자 겹침 피하기: 오른쪽이 막히면 왼쪽에
+    def label(x, y, r, t):
+        right = (x + r + 3, x + r + 3 + 7 * len(t))
+        hit = any(abs(py - y) < 13 and px1 < right[1] and px2 > right[0] for px1, px2, py in placed) or right[1] > W - R
+        x1 = x - r - 3 - 7 * len(t) if hit else right[0]
+        placed.append((x1, x1 + 7 * len(t), y))
+        return f'<text x="{x1:.1f}" y="{y + 4:.1f}" class="plab">{escape(t)}</text>'
+    for c in pts:                                                        # 점 자리를 먼저 막아 둠 (글자가 점을 덮지 않게)
+        r = 4 + c["scores"]["margin"] * 1.6
+        placed.append((sx(vol(c)) - r, sx(vol(c)) + r, sy(c["_total"])))
+    for c in sorted(pts, key=lambda c: -c["scores"]["margin"]):          # 큰 점부터 그려 작은 점이 위에
+        n = c["_naver"]
+        trend = (n.get("shopping_insight") or {}).get("trend")
+        x, y, r = sx(vol(c)), sy(c["_total"]), 4 + c["scores"]["margin"] * 1.6
+        sign = lambda v: "미확인" if v is None else f"{v:+d}%"
+        tip = (f"#{c.get('_id') or '-'} {c['name']} · 총점 {c['_total']} · 검색량 {n['volume_idx']} · "
+               f"3개월 {sign(n.get('growth_3m'))} · 전년 {sign(n.get('yoy'))} · 마진 여지 {c['scores']['margin']}점 · "
+               f"쇼핑 추세 {shop_trend_cell(n) or '없음'}")
+        dot = (f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r:.1f}" fill="{TREND_COLOR.get(trend, "var(--muted)")}" '
+               f'fill-opacity=".85" stroke="var(--card)" stroke-width="2"><title>{escape(tip)}</title></circle>'
+               + label(x, y, r, str(c.get("_id") or "")))
+        g.append(f'<a href="#c{c["_id"]}">{dot}</a>' if c.get("_id") else dot)
+    legend = "".join(f'<span><i style="background:{col}"></i>{t}</span>' for t, col in
+                     [*TREND_COLOR.items(), ("추세 없음", "var(--muted)")])
+    miss = [c for c in candidates if c not in pts]
+    miss_html = (f"<p class='small muted'>검색량 미확인으로 빠진 후보 {len(miss)}개: "
+                 + ", ".join(f"#{escape(str(c.get('_id') or '-'))} {escape(c['name'])}" for c in miss) + "</p>"
+                 if miss else "")
+    return (f"<section class='card'><h2>후보 지도</h2>"
+            f"<p class='sub' style='margin:0 0 8px'>오른쪽 위일수록 검색량도 많고 점수도 높은 후보입니다. "
+            f"점 크기는 마진 여지 점수, 점 색은 네이버 쇼핑 클릭 추세입니다. 점에 마우스를 올리면 수치가 보이고, 누르면 표의 그 줄로 갑니다.</p>"
+            f"<div class='legend'>{legend}<span class='muted'>· 큰 점 = 마진 여지 높음</span></div>"
+            f"<div class='scroll'><svg class='cmap' viewBox='0 0 {W} {H}' role='img' aria-label='후보 지도: 검색량지수와 총점'>{''.join(g)}</svg></div>"
+            f"{miss_html}</section>")
+
+
+MAP_STYLE = """
+.cmap{width:100%;min-width:560px;height:auto;display:block}.cmap .grid{stroke:var(--line);stroke-width:1}
+.cmap .tick{fill:var(--muted);font-size:11px}.cmap .axis{fill:var(--muted);font-size:12px}
+.cmap .plab{fill:var(--text);font-size:11px;font-weight:700;pointer-events:none}.cmap .mlab{fill:var(--good);font-size:11px}
+.cmap a:hover circle{stroke:var(--text)}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;margin:0 0 4px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+.small{font-size:12px}.muted{color:var(--muted)}tr:target td{background:var(--warnbg)}
+"""
+
+
 def write_candidates(outdir, candidates, args):
     from html import escape
     outdir.mkdir(parents=True, exist_ok=True)
@@ -639,7 +722,7 @@ def write_candidates(outdir, candidates, args):
     H = [f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>후보 품목 {datetime.now():%Y-%m-%d}</title><style>{HTML_STYLE}
-.ref{{font-size:12px}}.pname{{min-width:220px}}.score{{font-weight:700}}.s5,.s4{{color:var(--good)}}.s3{{color:var(--mid)}}.s2,.s1{{color:var(--bad)}}</style></head><body><main>
+.ref{{font-size:12px}}.pname{{min-width:220px}}.score{{font-weight:700}}.s5,.s4{{color:var(--good)}}.s3{{color:var(--mid)}}.s2,.s1{{color:var(--bad)}}{MAP_STYLE}</style></head><body><main>
 <h1>후보 품목 점수표</h1>
 <p class="sub">{datetime.now():%Y-%m-%d %H:%M}{hint} · 총점 가중치: {weights}<br>
 각 항목 1~5점(5가 유리). 판매가·FOB 시세는 웹 검색 기준 참고값입니다.{naver_note}</p>
@@ -668,13 +751,13 @@ def write_candidates(outdir, candidates, args):
         if c.get("source_page_url"):
             ref += (f"{' · ' if ref else '<br>'}<a class='ref' href='{escape(c['source_page_url'], quote=True)}' "
                     "target='_blank' rel='noopener'>해외 판매 페이지 ↗</a>")
-        H.append(f"<tr><td>{e(c.get('_id'))}</td><td class='pname'><b>{escape(c['name'])}</b>{ref}</td><td>{escape(c['category'])}</td>"
+        H.append(f"<tr id='c{e(c.get('_id'))}'><td>{e(c.get('_id'))}</td><td class='pname'><b>{escape(c['name'])}</b>{ref}</td><td>{escape(c['category'])}</td>"
                  f"<td class='num'><b>{c['_total']}</b></td>{cells}"
                  f"<td title='{escape(c.get('source_country_reason') or '', quote=True)}'>"
                  f"{e(SOURCE_COUNTRIES.get(c.get('source_country'), c.get('source_country')))}</td>"
                  f"<td class='num'>{e(c.get('est_retail_krw'), '원')}</td>"
                  f"<td class='num'>{e(c.get('est_fob_usd'), ' USD')}</td>{cells_n}</tr>")
-    H.append("</table></div></section><section class='card'><h2>후보별 근거</h2><ul class='notes'>")
+    H.append("</table></div></section>" + candidate_map(candidates) + "<section class='card'><h2>후보별 근거</h2><ul class='notes'>")
     for i, c in enumerate(candidates, 1):
         risk = f"<br><span class='flag'>⚠️ {escape(c['risk'])}</span>" if c.get("risk") else ""
         H.append(f"<li><b>[{e(c.get('_id'))}] {escape(c['name'])}</b> ({escape(c['search_keyword_en'])})<br>{escape(c['reason'])}"

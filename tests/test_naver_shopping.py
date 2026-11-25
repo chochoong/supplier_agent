@@ -100,6 +100,7 @@ class ShoppingTrendsTest(unittest.TestCase):
         self.assertEqual(len(calls[0]["keyword"]), 1)
         self.assertEqual(out["찜기"]["trend"], "오름")
         self.assertEqual(out["찜기"]["category"], "생활/건강")
+        self.assertEqual(out["찜기"]["checked_at"], "2026-11-24")
         self.assertTrue(out["손난로"]["seasonal"]["is_seasonal"])
         self.assertEqual(out["키캡"]["trend"], "보합")
         ns.shopping_trends(items, fake, self.cache, today=TODAY)
@@ -140,6 +141,7 @@ class AgentTest(unittest.TestCase):
         self.assertEqual((si["cid"], si["trend"]), (ns.SHOP_CATEGORIES["생활/건강"], "오름"))
         self.assertNotIn("shopping_insight", cache["분야 모름"])
         self.assertEqual(cache["실리콘 찜기"]["shop_category"], "생활/건강")
+        self.assertEqual(cache["실리콘 찜기"]["checked_at"], "2026-11-24")              # 네이버 조회일
         self.assertIsNone(cache["분야 모름"]["shop_category"])                        # 분야 미정이 기록에 남음
         self.assertIn("volume_idx", cache["분야 모름"])
         self.assertEqual(sa.shop_trend_cell(cache["실리콘 찜기"]), "오름 +80%")
